@@ -44,8 +44,8 @@ param(
     
     # Processing options
     [switch]$AttachmentsOnly,            # Only process emails with attachments
-    [datetime]$StartDate,                # Optional date range start
-    [datetime]$EndDate,                  # Optional date range end
+    $StartDate,                          # Optional date range start (accepts string or datetime)
+    $EndDate,                            # Optional date range end (accepts string or datetime)
     [string]$SubjectFilter,              # Optional subject filter
     [int]$MaxMessages,                   # Limit number of messages
     
@@ -80,10 +80,8 @@ function Save-ReplayConfig {
         [hashtable]$Configuration
     )
     
-    # Remove sensitive data if saving template
     $safeConfig = $Configuration.Clone()
     
-    # Encrypt sensitive values if possible
     if ($Configuration.ClientSecret) {
         try {
             $secureString = ConvertTo-SecureString $Configuration.ClientSecret -AsPlainText -Force
@@ -92,7 +90,6 @@ function Save-ReplayConfig {
             $safeConfig.Remove('ClientSecret')
         }
         catch {
-            # If encryption fails, warn user
             Write-Warning "Could not encrypt ClientSecret - storing in plain text"
         }
     }
@@ -112,13 +109,11 @@ function Load-ReplayConfig {
     
     $configData = Get-Content $Path -Raw | ConvertFrom-Json
     
-    # Convert PSCustomObject to Hashtable
     $config = @{}
     $configData.PSObject.Properties | ForEach-Object {
         $config[$_.Name] = $_.Value
     }
     
-    # Decrypt sensitive values if encrypted
     if ($config.ClientSecretEncrypted -and !$config.ClientSecret) {
         try {
             $secureString = ConvertTo-SecureString $config.ClientSecretEncrypted
@@ -135,58 +130,84 @@ function Load-ReplayConfig {
     return $config
 }
 
-function Send-TrueTransparentReplay {
+# ================================
+# Date Parameter Hardening
+# ================================
+function Convert-ToSafeDate {
     param(
-        [string]$SourceMailbox,
-        [string]$MessageId,
-        [string]$TargetMailbox,
-        [string]$ReplayHeader     # "HeaderName:Value" or $null
+        [Parameter(Mandatory)]
+        $InputValue,
+        [string]$ParamName
     )
-    # 1. Get original MIME
-    $mimeContent = Get-MessageMimeContent -Mailbox $SourceMailbox -MessageId $MessageId
-    if (-not $mimeContent) { throw "Could not retrieve MIME content for message $MessageId" }
-
-    # 2. Prepare for Graph injection
-    $mimeBytes  = [System.Text.Encoding]::UTF8.GetBytes($mimeContent)
-    $mimeBase64 = [Convert]::ToBase64String($mimeBytes)
-    $uriBase    = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages"
-    $token      = Get-GraphToken
-    $headers    = @{
-        "Authorization" = "Bearer $token"
-        "Content-Type"  = "text/plain"
+    
+    # Already a datetime? Return untouched.
+    if ($InputValue -is [datetime]) {
+        return $InputValue
     }
-
-    # 3. Create the draft
-    $draftResp = Invoke-WebRequest -Method POST -Uri $uriBase -Headers $headers -Body $mimeBase64 -ErrorAction Stop
-    $draftId   = ($draftResp.Content | ConvertFrom-Json).id
-
-    # 4. Stamp header (optional)
-    if ($ReplayHeader) {
-        if ($ReplayHeader -match "^([^:]+):(.*)$") {
-            $headerName  = $matches[1].Trim()
-            $headerValue = $matches[2].Trim()
-            $patchBody = @{
-                internetMessageHeaders = @(
-                    @{
-                        name  = $headerName
-                        value = $headerValue
-                    }
-                )
-            } | ConvertTo-Json -Depth 10
-            Invoke-GraphRequest -Uri "$uriBase/$draftId" -Method PATCH -Body $patchBody
+    
+    # Null or empty → return null (for optional params)
+    if ($null -eq $InputValue -or [string]::IsNullOrWhiteSpace($InputValue)) {
+        return $null
+    }
+    
+    # Normalize input
+    $raw = $InputValue.ToString().Trim()
+    
+    # Supported formats (ISO + German + variations)
+    $formats = @(
+        'yyyy-MM-dd',
+        'yyyy-MM-ddTHH:mm:ss',
+        'yyyy-MM-ddTHH:mm:ssZ',
+        'yyyy-MM-ddTHH:mm:ss.fffZ',
+        'dd.MM.yyyy',
+        'dd.MM.yyyy HH:mm',
+        'dd.MM.yyyy HH:mm:ss',
+        'dd.MM.yyyyTHH:mm:ss',
+        'dd.MM.yyyyTHH:mm:ssZ'
+    )
+    
+    # Try explicit formats first (avoids ambiguity)
+    foreach ($fmt in $formats) {
+        try {
+            $parsed = [datetime]::ParseExact($raw, $fmt, [System.Globalization.CultureInfo]::InvariantCulture)
+            Write-Verbose "[$ParamName] Parsed '$raw' using format '$fmt' → $($parsed.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
+            return $parsed
         }
-        else {
-            Write-Log "ReplayHeader is not in 'HeaderName:Value' format. Skipping header stamp." -Level Warning
+        catch {
+            # Continue to next format
         }
     }
+    
+    # Fallback: Try universal parser (handles many ISO variants)
+    try {
+        $parsed = [datetime]::Parse($raw, [System.Globalization.CultureInfo]::InvariantCulture)
+        Write-Verbose "[$ParamName] Parsed '$raw' using universal parser → $($parsed.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
+        return $parsed
+    }
+    catch {
+        $errorMsg = @"
+Invalid date format for parameter '$ParamName': '$InputValue'
 
-    # 5. Send it
-    Invoke-GraphRequest -Uri "$uriBase/$draftId/send" -Method POST
-    Write-Log "TRUE TRANSPARENT replay sent (Target: $TargetMailbox, DraftId: $draftId, Source: $SourceMailbox/$MessageId)" -Level Success
+Accepted formats:
+  ISO formats:
+    • 2025-11-01
+    • 2025-11-01T13:05:00
+    • 2025-11-01T13:05:00Z
+  
+  German formats:
+    • 01.11.2025
+    • 01.11.2025 13:05
+    • 01.11.2025 13:05:00
 
-    return $draftId
+Examples:
+  -StartDate '2025-11-01'
+  -StartDate '01.11.2025'
+  -StartDate (Get-Date '2025-11-01')
+
+"@
+        throw $errorMsg
+    }
 }
-
 
 # Load configuration if provided
 if ($Config) {
@@ -211,6 +232,14 @@ if ($Config) {
         if ($loadedConfig.BatchSize) { $BatchSize = $loadedConfig.BatchSize }
         if ($loadedConfig.ThrottleMs) { $ThrottleMs = $loadedConfig.ThrottleMs }
         
+        # Load dates from config if not provided via command line
+        if (!$StartDate -and $loadedConfig.StartDate) { 
+            $StartDate = Convert-ToSafeDate -InputValue $loadedConfig.StartDate -ParamName 'StartDate (from config)'
+        }
+        if (!$EndDate -and $loadedConfig.EndDate) { 
+            $EndDate = Convert-ToSafeDate -InputValue $loadedConfig.EndDate -ParamName 'EndDate (from config)'
+        }
+        
         Write-Host "Configuration loaded successfully" -ForegroundColor Green
     }
     catch {
@@ -224,6 +253,38 @@ if ($Config) {
     if (!$ClientSecret) { throw "ClientSecret is required (not found in config or parameters)" }
     if (!$SourceMailboxes) { throw "SourceMailboxes is required (not found in config or parameters)" }
     if (!$TargetMailbox) { throw "TargetMailbox is required (not found in config or parameters)" }
+}
+
+# ================================
+# Apply Date Validation (for command-line params)
+# ================================
+if ($PSBoundParameters.ContainsKey('StartDate') -and $StartDate) {
+    try {
+        $StartDate = Convert-ToSafeDate -InputValue $StartDate -ParamName 'StartDate'
+        Write-Host "StartDate parsed: $($StartDate.ToString('yyyy-MM-ddTHH:mm:ssZ'))" -ForegroundColor Yellow
+    }
+    catch {
+        Write-Error $_.Exception.Message
+        throw
+    }
+}
+
+if ($PSBoundParameters.ContainsKey('EndDate') -and $EndDate) {
+    try {
+        $EndDate = Convert-ToSafeDate -InputValue $EndDate -ParamName 'EndDate'
+        Write-Host "EndDate parsed:   $($EndDate.ToString('yyyy-MM-ddTHH:mm:ssZ'))" -ForegroundColor Yellow
+    }
+    catch {
+        Write-Error $_.Exception.Message
+        throw
+    }
+}
+
+# Cross-validation: StartDate must be before EndDate
+if ($StartDate -and $EndDate -and $StartDate -gt $EndDate) {
+    $errorMsg = "StartDate ($($StartDate.ToString('yyyy-MM-dd'))) cannot be after EndDate ($($EndDate.ToString('yyyy-MM-dd')))"
+    Write-Error $errorMsg
+    throw $errorMsg
 }
 
 # ================================
@@ -244,13 +305,11 @@ if ($LogPath -and $LogSuccessful) {
         Join-Path (Get-Location).Path $LogPath
     }
     
-    # Ensure directory exists
     $logDir = [System.IO.Path]::GetDirectoryName($logFile)
     if (!(Test-Path $logDir)) {
         New-Item -ItemType Directory -Path $logDir -Force | Out-Null
     }
     
-    # Initialize log with timestamp
     $logHeader = @"
 ========================================
 Graph Email Replay Log
@@ -274,7 +333,6 @@ function Write-Log {
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $logMessage = "[$timestamp] [$Level] $Message"
     
-    # Console output with color
     switch ($Level) {
         "Success" { Write-Host $logMessage -ForegroundColor Green }
         "Warning" { Write-Host $logMessage -ForegroundColor Yellow }
@@ -282,7 +340,6 @@ function Write-Log {
         default   { Write-Host $logMessage -ForegroundColor Cyan }
     }
     
-    # File logging if enabled
     if ($LogPath -and $LogSuccessful) {
         Add-Content -Path $logFile -Value $logMessage -ErrorAction SilentlyContinue
     }
@@ -356,7 +413,7 @@ function Invoke-GraphRequest {
             return Invoke-RestMethod @params
         }
     }
-   catch {
+    catch {
         $err = $_
         $resp = $null
         if ($err.Exception -and $err.Exception.Response) {
@@ -381,145 +438,6 @@ function Invoke-GraphRequest {
     }
 }
 
-# ================================
-# Date Parameter Hardening
-# ================================
-
-# ================================
-# Date Parameter Hardening
-# ================================
-function Convert-ToSafeDate {
-    param(
-        [Parameter(Mandatory)]
-        $InputValue,
-        [string]$ParamName
-    )
-    
-    # Already a datetime? Return untouched.
-    if ($InputValue -is [datetime]) {
-        return $InputValue
-    }
-    
-    # Null or empty → return null (for optional params)
-    if ($null -eq $InputValue -or [string]::IsNullOrWhiteSpace($InputValue)) {
-        return $null
-    }
-    
-    # Normalize input
-    $raw = $InputValue.ToString().Trim()
-    
-    # Supported formats (ISO + German + variations)
-    $formats = @(
-        'yyyy-MM-dd',
-        'yyyy-MM-ddTHH:mm:ss',
-        'yyyy-MM-ddTHH:mm:ssZ',
-        'yyyy-MM-ddTHH:mm:ss.fffZ',
-        'dd.MM.yyyy',
-        'dd.MM.yyyy HH:mm',
-        'dd.MM.yyyy HH:mm:ss',
-        'dd.MM.yyyyTHH:mm:ss',
-        'dd.MM.yyyyTHH:mm:ssZ'
-    )
-    
-    # Try explicit formats first (avoids ambiguity)
-    foreach ($fmt in $formats) {
-        try {
-            $parsed = [datetime]::ParseExact($raw, $fmt, [System.Globalization.CultureInfo]::InvariantCulture)
-            Write-Verbose "[$ParamName] Parsed '$raw' using format '$fmt' → $($parsed.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
-            return $parsed
-        }
-        catch {
-            # Continue to next format
-        }
-    }
-    
-    # Fallback: Try universal parser (handles many ISO variants)
-    try {
-        $parsed = [datetime]::Parse($raw, [System.Globalization.CultureInfo]::InvariantCulture)
-        Write-Verbose "[$ParamName] Parsed '$raw' using universal parser → $($parsed.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
-        return $parsed
-    }
-    catch {
-        # Build clear error message
-        $errorMsg = @"
-Invalid date format for parameter '$ParamName': '$InputValue'
-
-Accepted formats:
-  ISO formats:
-    • 2025-11-01
-    • 2025-11-01T13:05:00
-    • 2025-11-01T13:05:00Z
-  
-  German formats:
-    • 01.11.2025
-    • 01.11.2025 13:05
-    • 01.11.2025 13:05:00
-
-Examples:
-  -StartDate '2025-11-01'
-  -StartDate '01.11.2025'
-  -StartDate (Get-Date '2025-11-01')
-
-"@
-        throw $errorMsg
-    }
-}
-
-
-if ($loadedConfig.StartDate) { 
-    $StartDate = Convert-ToSafeDate -InputValue $loadedConfig.StartDate -ParamName 'StartDate'
-}
-if ($loadedConfig.EndDate) { 
-    $EndDate = Convert-ToSafeDate -InputValue $loadedConfig.EndDate -ParamName 'EndDate'
-}
-# ================================
-# Apply Date Validation
-# ================================
-if ($PSBoundParameters.ContainsKey('StartDate')) {
-    try {
-        $StartDate = Convert-ToSafeDate -InputValue $StartDate -ParamName 'StartDate'
-        if ($StartDate) {
-            Write-Log "StartDate parsed: $($StartDate.ToString('yyyy-MM-ddTHH:mm:ssZ'))" -Level Info
-        }
-    }
-    catch {
-        Write-Log $_.Exception.Message -Level Error
-        throw
-    }
-}
-
-if ($PSBoundParameters.ContainsKey('EndDate')) {
-    try {
-        $EndDate = Convert-ToSafeDate -InputValue $EndDate -ParamName 'EndDate'
-        if ($EndDate) {
-            Write-Log "EndDate parsed:   $($EndDate.ToString('yyyy-MM-ddTHH:mm:ssZ'))" -Level Info
-        }
-    }
-    catch {
-        Write-Log $_.Exception.Message -Level Error
-        throw
-    }
-}
-
-# Cross-validation: StartDate must be before EndDate
-if ($StartDate -and $EndDate -and $StartDate -gt $EndDate) {
-    $errorMsg = "StartDate ($($StartDate.ToString('yyyy-MM-dd'))) cannot be after EndDate ($($EndDate.ToString('yyyy-MM-dd')))"
-    Write-Log $errorMsg -Level Error
-    throw $errorMsg
-}
-
-
-# Convert if provided
-if ($PSBoundParameters.ContainsKey('StartDate')) {
-    $StartDate = Convert-ToSafeDate -InputValue $StartDate -ParamName 'StartDate'
-    Write-Host "StartDate parsed: $($StartDate.ToString('yyyy-MM-ddTHH:mm:ssZ'))" -ForegroundColor Yellow
-}
-
-if ($PSBoundParameters.ContainsKey('EndDate')) {
-    $EndDate = Convert-ToSafeDate -InputValue $EndDate -ParamName 'EndDate'
-    Write-Host "EndDate parsed:   $($EndDate.ToString('yyyy-MM-ddTHH:mm:ssZ'))" -ForegroundColor Yellow
-}
-
 function Get-MailboxMessages {
     param(
         [string]$Mailbox,
@@ -533,7 +451,6 @@ function Get-MailboxMessages {
     
     Write-Log "Fetching messages from $Mailbox/$Folder" -Level Info
     
-    # Build filter
     $filters = @()
     
     if ($StartDate) {
@@ -554,7 +471,6 @@ function Get-MailboxMessages {
     
     $filter = if ($filters) { "&`$filter=" + ($filters -join " and ") } else { "" }
     
-    # Folder name normalization
     $folderName = switch -Regex ($Folder) {
         "^(Inbox|Posteingang)$" { "inbox" }
         "^(Sent|Gesendete)" { "sentitems" }
@@ -623,6 +539,54 @@ function Get-MessageMimeContent {
     }
 }
 
+function Send-TrueTransparentReplay {
+    param(
+        [string]$SourceMailbox,
+        [string]$MessageId,
+        [string]$TargetMailbox,
+        [string]$ReplayHeader
+    )
+    
+    $mimeContent = Get-MessageMimeContent -Mailbox $SourceMailbox -MessageId $MessageId
+    if (-not $mimeContent) { throw "Could not retrieve MIME content for message $MessageId" }
+
+    $mimeBytes  = [System.Text.Encoding]::UTF8.GetBytes($mimeContent)
+    $mimeBase64 = [Convert]::ToBase64String($mimeBytes)
+    $uriBase    = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages"
+    $token      = Get-GraphToken
+    $headers    = @{
+        "Authorization" = "Bearer $token"
+        "Content-Type"  = "text/plain"
+    }
+
+    $draftResp = Invoke-WebRequest -Method POST -Uri $uriBase -Headers $headers -Body $mimeBase64 -ErrorAction Stop
+    $draftId   = ($draftResp.Content | ConvertFrom-Json).id
+
+    if ($ReplayHeader) {
+        if ($ReplayHeader -match "^([^:]+):(.*)$") {
+            $headerName  = $matches[1].Trim()
+            $headerValue = $matches[2].Trim()
+            $patchBody = @{
+                internetMessageHeaders = @(
+                    @{
+                        name  = $headerName
+                        value = $headerValue
+                    }
+                )
+            } | ConvertTo-Json -Depth 10
+            Invoke-GraphRequest -Uri "$uriBase/$draftId" -Method PATCH -Body $patchBody
+        }
+        else {
+            Write-Log "ReplayHeader is not in 'HeaderName:Value' format. Skipping header stamp." -Level Warning
+        }
+    }
+
+    Invoke-GraphRequest -Uri "$uriBase/$draftId/send" -Method POST
+    Write-Log "TRUE TRANSPARENT replay sent (Target: $TargetMailbox, DraftId: $draftId, Source: $SourceMailbox/$MessageId)" -Level Success
+
+    return $draftId
+}
+
 function Send-TransparentReplay {
     param(
         [string]$SourceMailbox,
@@ -631,13 +595,11 @@ function Send-TransparentReplay {
         [string[]]$BccAddresses
     )
     
-    # 1) Get original MIME
     $mimeContent = Get-MessageMimeContent -Mailbox $SourceMailbox -MessageId $MessageId
     if (-not $mimeContent) {
         throw "Could not retrieve MIME content for message $MessageId"
     }
 
-    # 2) Build resent headers + processed header
     $additionalHeaders = @"
 Resent-Date: $(Get-Date -Format 'r')
 Resent-From: $SourceMailbox
@@ -648,19 +610,10 @@ ${ProcessedHeader}: true
 
 "@
 
-    # Prepend our headers to the original MIME
     $finalMime = $additionalHeaders + $mimeContent
-
-    # NOTE:
-    # This leaves the original To/Cc/Bcc in place. Graph will deliver to those.
-    # If you want ONLY the TargetMailbox to receive, you'd also need to rewrite
-    # the To:/Cc:/Bcc: lines in $finalMime here.
-
-    # 3) Convert MIME to bytes and base64 encode (required by Graph)
     $mimeBytes  = [System.Text.Encoding]::UTF8.GetBytes($finalMime)
     $mimeBase64 = [Convert]::ToBase64String($mimeBytes)
 
-    # 4) Send via /sendMail with MIME body
     $uri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/sendMail"
 
     $token = Get-GraphToken
@@ -669,40 +622,10 @@ ${ProcessedHeader}: true
         "Content-Type"  = "text/plain"
     }
 
-    # For MIME, the body is just the base64 string, not JSON
     $null = Invoke-WebRequest -Method POST -Uri $uri -Headers $headers -Body $mimeBase64
 
-    # sendMail with MIME returns 202, no body. Return a synthetic ID for logging.
     return "mime-" + ([guid]::NewGuid().ToString())
 }
-
-function Clean-EmailField {
-    param([string]$input)
-    if ($null -eq $input) { return "" }
-    # Try UTF7 decode if it looks like it (as before)
-    if ($input -match '\+[A-Za-z0-9/]+-') {
-        try {
-            $bytes = [System.Text.Encoding]::UTF8.GetBytes($input)
-            $input = [System.Text.Encoding]::UTF7.GetString($bytes)
-        } catch {}
-    }
-    # Replace common German/Euro chars to HTML entity
-    $input = $input -replace 'ü', '&#252;'
-    $input = $input -replace 'Ü', '&#220;'
-    $input = $input -replace 'ä', '&#228;'
-    $input = $input -replace 'Ä', '&#196;'
-    $input = $input -replace 'ö', '&#246;'
-    $input = $input -replace 'Ö', '&#214;'
-    $input = $input -replace 'ß', '&#223;'
-    $input = $input -replace '[éèêë]', '&#233;' # Just map all to e-acute
-    # Remove Unicode replacement chars and unprintable
-    $input = $input -replace '[\uFFFD]', ''
-    $input = $input -replace '[^\u0020-\u007E]', ''
-    # Strip leading/trailing
-    $input = $input.Trim()
-    return $input
-}
-
 
 function As-Array {
     param($maybeArray)
@@ -711,19 +634,17 @@ function As-Array {
     return @($maybeArray)
 }
 
-
-    # Build wrapper email
 function Fix-Encoding {
     param($str)
     if ($null -eq $str) { return "" }
-    # Attempt to fix any double-encoded UTF8
     $bytes = [System.Text.Encoding]::Default.GetBytes($str)
     try {
         $utf8Str = [System.Text.Encoding]::UTF8.GetString($bytes)
-        if ($utf8Str -match '[\u00C0-\u017F]') { return $utf8Str } # If we see real non-ASCII, return it
+        if ($utf8Str -match '[\u00C0-\u017F]') { return $utf8Str }
     } catch { }
     return $str
 }
+
 function Safe-EmailName {
     param(
         [object]$emailObj,
@@ -750,26 +671,6 @@ function Safe-EmailName {
     return $fallback
 }
 
-
-
-$originalFrom = Safe-EmailName $Message.from.emailAddress
-$originalTo = (As-Array $Message.toRecipients | ForEach-Object {
-    Safe-EmailName $_.emailAddress
-}) -join ", "
-
-
-foreach ($message in $messages) {
-    if ($DebugOutput) {
-        Write-Host "RAW from: $($Message.from | ConvertTo-Json -Compress)"
-        Write-Host "RAW to: $($Message.toRecipients | ConvertTo-Json -Compress)"
-        Write-Host "RAW cc: $($Message.ccRecipients | ConvertTo-Json -Compress)"
-        Write-Host "RAW bcc: $($Message.bccRecipients | ConvertTo-Json -Compress)"
-    }
-    # ...rest of your logic...
-}
-
-$receivedTime = [datetime]::Parse($Message.receivedDateTime).ToString("dd.MM.yyyy HH:mm")
-
 function Send-WrapperReplay {
     param(
         [string]$SourceMailbox,
@@ -778,35 +679,24 @@ function Send-WrapperReplay {
         [string[]]$BccAddresses
     )
 
-    #
-    # 1. MIME content for .eml attachment
-    #
     $mimeContent = Get-MessageMimeContent -Mailbox $SourceMailbox -MessageId $Message.id
     if (-not $mimeContent) { throw "Could not retrieve MIME content" }
     $mimeBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($mimeContent))
 
-    #
-    # 2. Fetch full message including attachments, body, etc.
-    #
     $uri = "https://graph.microsoft.com/v1.0/users/$SourceMailbox/messages/$($Message.id)?`$expand=attachments"
     $fullMessage = Invoke-GraphRequest -Uri $uri
     $attachments = $fullMessage.attachments
     $originalBody = $fullMessage.body.content
     $bodyType = $fullMessage.body.contentType
 
-    #
-    # 3. Fix sender/recipient names
-    #
     $originalFrom = Safe-EmailName $Message.from.emailAddress
     $originalTo = (As-Array $Message.toRecipients | ForEach-Object {
         Safe-EmailName $_.emailAddress
     }) -join ", "
 
-    $receivedTime = [datetime]::Parse($Message.receivedDateTime).ToString("dd.MM.yyyy HH:mm")
+    # FIX: Use locale-safe datetime parsing
+    $receivedTime = ([datetime]::Parse($Message.receivedDateTime, [System.Globalization.CultureInfo]::InvariantCulture)).ToString("dd.MM.yyyy HH:mm")
 
-    #
-    # 4. Build banner + original body
-    #
     $renderedOriginalBody =
         if ($bodyType -eq "HTML") { $originalBody }
         else { [System.Web.HttpUtility]::HtmlEncode($originalBody) }
@@ -837,9 +727,6 @@ $renderedOriginalBody
 <i>All original attachments are attached below along with the .eml file.</i>
 "@
 
-    #
-    # 5. Build attachment list (original attachments + .eml)
-    #
     $attachmentsList = @()
 
     foreach ($att in $attachments) {
@@ -853,7 +740,6 @@ $renderedOriginalBody
         }
     }
 
-    # Add full original MIME
     $attachmentsList += @{
         "@odata.type" = "#microsoft.graph.fileAttachment"
         name = "Original_Message.eml"
@@ -861,9 +747,6 @@ $renderedOriginalBody
         contentBytes = $mimeBase64
     }
 
-    #
-    # 6. Build the wrapper message object
-    #
     $newMessage = @{
         subject = "[REPLAYED] $($Message.subject)"
         body = @{
@@ -886,9 +769,6 @@ $renderedOriginalBody
             }
     }
 
-    #
-    # 7. Send
-    #
     $uri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/sendMail"
     $body = @{
         message = $newMessage
@@ -899,7 +779,6 @@ $renderedOriginalBody
 
     return "wrapper-$(New-Guid)"
 }
-
 
 function Send-TestEmail {
     param(
@@ -947,50 +826,16 @@ function Send-TestEmail {
         return $true
     }
     catch {
-        $errorCount++
-        $err = $_
-
-        $msg = "Failed to send: $($message.subject) - Error: $err"
-
-        # Try to extract Graph error body, if available
-        if ($err.Exception -and $err.Exception.Response) {
-            try {
-                $resp = $err.Exception.Response
-                $stream = $resp.GetResponseStream()
-                if ($stream) {
-                    $reader = New-Object System.IO.StreamReader($stream)
-                    $bodyText = $reader.ReadToEnd()
-                    if ($bodyText) {
-                        $msg += " | Response: $bodyText"
-                    }
-                }
-            } catch { }
-        }
-
-        Write-Log $msg -Level Error
-
-        if ($LogPath) {
-            $errorEntry = @{
-                Timestamp     = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-                SourceMailbox = $sourceMailbox
-                MessageId     = $message.id
-                Subject       = $message.subject
-                Error         = $err.ToString()
-            }
-            $errorEntry | ConvertTo-Json -Compress |
-                Add-Content -Path ($logFile -replace '\.log$', '_errors.log')
-        }
+        Write-Log "Test email failed: $_" -Level Error
+        return $false
     }
-}   #  
-
-
+}
 
 # ================================
 # Main Processing
 # ================================
 
 try {
-    # Display configuration
     Write-Log "=== Graph Email Replay Configuration ===" -Level Info
     Write-Log "Tenant ID: $TenantId" -Level Info
     Write-Log "Client ID: $ClientId" -Level Info
@@ -1018,7 +863,6 @@ try {
         Write-Log "*** WHATIF MODE - No emails will be sent ***" -Level Warning
     }
     
-    # Test mode
     if ($TestMode) {
         $testSource = if ($TestMailbox) { $TestMailbox } else { $SourceMailboxes[0] }
         Write-Log "Running in TEST MODE - Sending test email only" -Level Warning
@@ -1033,12 +877,10 @@ try {
         return
     }
     
-    # Process each source mailbox
     foreach ($sourceMailbox in $SourceMailboxes) {
         Write-Log "`nProcessing mailbox: $sourceMailbox" -Level Info
         
         try {
-            # Get messages
             $messages = Get-MailboxMessages `
                 -Mailbox $sourceMailbox `
                 -Folder $FolderName `
@@ -1056,64 +898,48 @@ try {
             Write-Log "Processing $($messages.Count) messages from $sourceMailbox" -Level Info
             
             foreach ($message in $messages) {
-                # Check if already processed
                 if (Test-AlreadyProcessed -Message $message) {
                     Write-Log "Skipping (already processed): $($message.subject)" -Level Info
                     $skippedCount++
                     continue
                 }
                 
-                # Check max messages limit
                 if ($MaxMessages -and $processedCount -ge $MaxMessages) {
                     Write-Log "Reached maximum message limit ($MaxMessages)" -Level Warning
                     break
                 }
                 
-                # Display what we're doing
                 $action = if ($WhatIf) { "[WHATIF]" } else { "[SENDING]" }
                 Write-Log "$action $($message.subject) (from: $($message.from.emailAddress.address))" -Level Info
                 
                 if (-not $WhatIf) {
                     try {
-                        # Send based on mode
                         $sentId = if ($ReplayMode -eq "Transparent") {
                             if ($TrueTransparentReplay) {
-        Send-TrueTransparentReplay `
-
-            -SourceMailbox $sourceMailbox `
-            -MessageId $message.id `
-            -TargetMailbox $TargetMailbox `
-            -ReplayHeader $ReplayHeader
-    }
-    else {
-        Send-TransparentReplay `
-            -SourceMailbox $sourceMailbox `
-            -MessageId $message.id `
-            -TargetMailbox $TargetMailbox `
-            -BccAddresses $BccAlways
-    }
-}
-else {
-    Send-WrapperReplay `
-        -SourceMailbox $sourceMailbox `
-        -Message $message `
-        -TargetMailbox $TargetMailbox `
-        -BccAddresses $BccAlways
-}
-                        if ($ReplayMode -eq "Transparent" -and $TrueTransparentReplay) {
-    Write-Log "Using TRUE TRANSPARENT replay mode (Graph /messages injection)" -Level Info
-}
-elseif ($ReplayMode -eq "Transparent") {
-    Write-Log "Using legacy transparent replay mode (Resent headers)" -Level Info
-}
-else {
-    Write-Log "Using WRAPPER replay mode (banner+attachment)" -Level Info
-}
-    
+                                Send-TrueTransparentReplay `
+                                    -SourceMailbox $sourceMailbox `
+                                    -MessageId $message.id `
+                                    -TargetMailbox $TargetMailbox `
+                                    -ReplayHeader $ReplayHeader
+                            }
+                            else {
+                                Send-TransparentReplay `
+                                    -SourceMailbox $sourceMailbox `
+                                    -MessageId $message.id `
+                                    -TargetMailbox $TargetMailbox `
+                                    -BccAddresses $BccAlways
+                            }
+                        }
+                        else {
+                            Send-WrapperReplay `
+                                -SourceMailbox $sourceMailbox `
+                                -Message $message `
+                                -TargetMailbox $TargetMailbox `
+                                -BccAddresses $BccAlways
+                        }
 
                         $processedCount++
                         
-                        # Log success
                         if ($LogSuccessful) {
                             $logEntry = @{
                                 Timestamp     = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
@@ -1132,7 +958,6 @@ else {
                         
                         Write-Log "Successfully sent: $($message.subject)" -Level Success
                         
-                        # Throttle
                         if ($ThrottleMs -gt 0) {
                             Start-Sleep -Milliseconds $ThrottleMs
                         }
@@ -1141,7 +966,6 @@ else {
                         $errorCount++
                         Write-Log "Failed to send: $($message.subject) - Error: $_" -Level Error
                         
-                        # Log error
                         if ($LogPath) {
                             $logBase = [IO.Path]::GetFileNameWithoutExtension($logFile)
                             $logDir  = [IO.Path]::GetDirectoryName($logFile)
@@ -1169,7 +993,6 @@ else {
         }
     }
     
-    # Final summary
     Write-Log "`n========================================" -Level Info
     Write-Log "Processing Complete" -Level Success
     Write-Log "========================================" -Level Info
@@ -1186,7 +1009,6 @@ catch {
     throw
 }
 finally {
-    # Cleanup
     if ($LogPath) {
         $footer = @"
 ========================================

@@ -25,124 +25,77 @@ function New-ConfigFile {
     Write-Host "Creating new configuration file..." -ForegroundColor Cyan
     Write-Host "Please provide the following information:" -ForegroundColor Yellow
     
-    # We'll keep it as a PSCustomObject for simplicity
-    $config = [PSCustomObject]@{}
+    $config = @{}
     
     # Required fields
-    $tenantId = Read-Host "Tenant ID (required)"
-    $clientId = Read-Host "Client ID (required)"
-    
-    if (-not $tenantId -or -not $clientId) {
-        Write-Error "Tenant ID and Client ID are required."
-        return
-    }
-    
-    $config | Add-Member -NotePropertyName TenantId -NotePropertyValue $tenantId
-    $config | Add-Member -NotePropertyName ClientId -NotePropertyValue $clientId
+    $config.TenantId = Read-Host "Tenant ID (required)"
+    $config.ClientId = Read-Host "Client ID (required)"
     
     # Handle secret securely
     $secretResponse = Read-Host "Client Secret (required)" -AsSecureString
-    $plainSecret = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
+    $config.ClientSecret = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
         [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secretResponse)
     )
     
     # Source mailboxes
     $mailboxInput = Read-Host "Source Mailboxes (comma-separated)"
-    $sourceMailboxes = $mailboxInput -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+    $config.SourceMailboxes = $mailboxInput -split ',' | ForEach-Object { $_.Trim() }
     
-    if (-not $sourceMailboxes) {
-        Write-Error "At least one source mailbox is required."
-        return
-    }
-    
-    $targetMailbox = Read-Host "Target Mailbox (required)"
-    if (-not $targetMailbox) {
-        Write-Error "Target mailbox is required."
-        return
-    }
-    
-    $config | Add-Member -NotePropertyName SourceMailboxes -NotePropertyValue $sourceMailboxes
-    $config | Add-Member -NotePropertyName TargetMailbox   -NotePropertyValue $targetMailbox
+    $config.TargetMailbox = Read-Host "Target Mailbox (required)"
     
     # Optional fields
     Write-Host "`nOptional settings (press Enter to skip):" -ForegroundColor Yellow
     
     $folder = Read-Host "Folder Name [Inbox]"
-    if ($folder) {
-        $config | Add-Member -NotePropertyName FolderName -NotePropertyValue $folder
-    }
+    if ($folder) { $config.FolderName = $folder }
     
     $mode = Read-Host "Replay Mode (Transparent/Wrapper) [Transparent]"
-    if ($mode) {
-        $config | Add-Member -NotePropertyName ReplayMode -NotePropertyValue $mode
-    }
+    if ($mode) { $config.ReplayMode = $mode }
     
     $attachOnly = Read-Host "Attachments Only (true/false) [false]"
-    if ($attachOnly -eq 'true') {
-        $config | Add-Member -NotePropertyName AttachmentsOnly -NotePropertyValue $true
-    }
+    if ($attachOnly -eq 'true') { $config.AttachmentsOnly = $true }
     
     $skipProcessed = Read-Host "Skip Already Processed (true/false) [false]"
-    if ($skipProcessed -eq 'true') {
-        $config | Add-Member -NotePropertyName SkipAlreadyProcessed -NotePropertyValue $true
-    }
+    if ($skipProcessed -eq 'true') { $config.SkipAlreadyProcessed = $true }
     
     $bcc = Read-Host "BCC Always (comma-separated)"
-    if ($bcc) {
-        $bccList = $bcc -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
-        if ($bccList) {
-            $config | Add-Member -NotePropertyName BccAlways -NotePropertyValue $bccList
-        }
+    if ($bcc) { 
+        $config.BccAlways = $bcc -split ',' | ForEach-Object { $_.Trim() }
     }
     
     $logPath = Read-Host "Log Path"
-    if ($logPath) {
-        $config | Add-Member -NotePropertyName LogPath -NotePropertyValue $logPath
-    }
+    if ($logPath) { $config.LogPath = $logPath }
     
     $maxMsg = Read-Host "Max Messages"
-    if ($maxMsg) {
-        $config | Add-Member -NotePropertyName MaxMessages -NotePropertyValue ([int]$maxMsg)
-    }
+    if ($maxMsg) { $config.MaxMessages = [int]$maxMsg }
     
     $batchSize = Read-Host "Batch Size [50]"
-    if ($batchSize) {
-        $config | Add-Member -NotePropertyName BatchSize -NotePropertyValue ([int]$batchSize)
-    }
+    if ($batchSize) { $config.BatchSize = [int]$batchSize }
     
     $throttle = Read-Host "Throttle MS [100]"
-    if ($throttle) {
-        $config | Add-Member -NotePropertyName ThrottleMs -NotePropertyValue ([int]$throttle)
-    }
+    if ($throttle) { $config.ThrottleMs = [int]$throttle }
     
     $header = Read-Host "Processed Header [X-GraphReplay-Processed]"
-    if ($header) {
-        $config | Add-Member -NotePropertyName ProcessedHeader -NotePropertyValue $header
-    }
+    if ($header) { $config.ProcessedHeader = $header }
     
     # Add metadata
-    $config | Add-Member -NotePropertyName CreatedDate -NotePropertyValue (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-    $config | Add-Member -NotePropertyName CreatedBy   -NotePropertyValue $env:USERNAME
-    
-    $desc = Read-Host "Description/Notes"
-    if ($desc) {
-        $config | Add-Member -NotePropertyName Description -NotePropertyValue $desc
-    }
+    $config.CreatedDate = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $config.CreatedBy = $env:USERNAME
+    $config.Description = Read-Host "Description/Notes"
     
     # Encrypt the secret
     try {
-        $secureString = ConvertTo-SecureString $plainSecret -AsPlainText -Force
-        $encrypted    = ConvertFrom-SecureString $secureString
-        $config | Add-Member -NotePropertyName ClientSecretEncrypted -NotePropertyValue $encrypted
+        $secureString = ConvertTo-SecureString $config.ClientSecret -AsPlainText -Force
+        $config.ClientSecretEncrypted = ConvertFrom-SecureString $secureString
+        $config.Remove('ClientSecret')
         Write-Host "Client Secret encrypted successfully" -ForegroundColor Green
     }
     catch {
-        Write-Warning "Could not encrypt Client Secret - storing in plain text"
-        $config | Add-Member -NotePropertyName ClientSecret -NotePropertyValue $plainSecret
+        Write-Warning "Could not encrypt Client Secret - will be stored in plain text"
     }
     
     # Save configuration
-    $config | ConvertTo-Json -Depth 10 | Set-Content -Path $Path -Encoding UTF8
+    $config | ConvertTo-Json -Depth 10 | Set-Content -Path $Path
     Write-Host "`nConfiguration saved to: $Path" -ForegroundColor Green
     
     # Offer to test
@@ -160,13 +113,14 @@ function Update-ConfigFile {
         return
     }
     
-    $config = Get-Content $Path -Raw | ConvertFrom-Json
+    $config = Get-Content $Path -Raw | ConvertFrom-Json | ConvertTo-HashTable
     
     Write-Host "Current configuration:" -ForegroundColor Cyan
     Show-ConfigFile -Path $Path
     
     Write-Host "`nEnter new values (press Enter to keep current):" -ForegroundColor Yellow
     
+    # Update each field
     $newTenant = Read-Host "Tenant ID [$($config.TenantId)]"
     if ($newTenant) { $config.TenantId = $newTenant }
     
@@ -176,16 +130,14 @@ function Update-ConfigFile {
     $updateSecret = Read-Host "Update Client Secret? (y/n)"
     if ($updateSecret -eq 'y') {
         $secretResponse = Read-Host "Client Secret" -AsSecureString
-        $newSecret      = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
+        $newSecret = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
             [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secretResponse)
         )
         
+        # Encrypt the new secret
         $secureString = ConvertTo-SecureString $newSecret -AsPlainText -Force
         $config.ClientSecretEncrypted = ConvertFrom-SecureString $secureString
-        # Remove plain-text if present
-        if ($config.PSObject.Properties['ClientSecret']) {
-            $config.PSObject.Properties.Remove('ClientSecret')
-        }
+        $config.Remove('ClientSecret')
     }
     
     $newTarget = Read-Host "Target Mailbox [$($config.TargetMailbox)]"
@@ -193,10 +145,10 @@ function Update-ConfigFile {
     
     # Update metadata
     $config.ModifiedDate = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $config.ModifiedBy   = $env:USERNAME
+    $config.ModifiedBy = $env:USERNAME
     
     # Save updated configuration
-    $config | ConvertTo-Json -Depth 10 | Set-Content -Path $Path -Encoding UTF8
+    $config | ConvertTo-Json -Depth 10 | Set-Content -Path $Path
     Write-Host "`nConfiguration updated successfully" -ForegroundColor Green
 }
 
@@ -232,18 +184,13 @@ function Test-ConfigFile {
             $secret = $configData.ClientSecret
         }
         
-        if (-not $secret) {
-            Write-Error "No client secret available in configuration."
-            return
-        }
-        
         # Test authentication
         Write-Host "Testing authentication..." -ForegroundColor Yellow
         $body = @{
             client_id     = $configData.ClientId
             client_secret = $secret
-            scope         = "https://graph.microsoft.com/.default"
-            grant_type    = "client_credentials"
+            scope        = "https://graph.microsoft.com/.default"
+            grant_type   = "client_credentials"
         }
         
         $tokenUrl = "https://login.microsoftonline.com/$($configData.TenantId)/oauth2/v2.0/token"
@@ -261,7 +208,7 @@ function Test-ConfigFile {
             foreach ($mailbox in $configData.SourceMailboxes) {
                 try {
                     $uri = "https://graph.microsoft.com/v1.0/users/$mailbox/mailFolders/inbox/messages?`$top=1"
-                    $null = Invoke-RestMethod -Uri $uri -Headers $headers
+                    $testResponse = Invoke-RestMethod -Uri $uri -Headers $headers
                     Write-Host "  ✓ $mailbox - Accessible" -ForegroundColor Green
                 }
                 catch {
@@ -272,7 +219,7 @@ function Test-ConfigFile {
             # Test target mailbox
             try {
                 $uri = "https://graph.microsoft.com/v1.0/users/$($configData.TargetMailbox)"
-                $null = Invoke-RestMethod -Uri $uri -Headers $headers
+                $testResponse = Invoke-RestMethod -Uri $uri -Headers $headers
                 Write-Host "✓ Target mailbox accessible: $($configData.TargetMailbox)" -ForegroundColor Green
             }
             catch {
@@ -312,12 +259,42 @@ function Show-ConfigFile {
     }
 }
 
+function ConvertTo-HashTable {
+    param(
+        [Parameter(ValueFromPipeline)]
+        $InputObject
+    )
+    
+    process {
+        if ($null -eq $InputObject) { return $null }
+        
+        if ($InputObject -is [System.Collections.IEnumerable] -and $InputObject -isnot [string]) {
+            $collection = @(
+                foreach ($object in $InputObject) {
+                    ConvertTo-HashTable $object
+                }
+            )
+            return ,$collection
+        }
+        elseif ($InputObject -is [psobject]) {
+            $hash = @{}
+            foreach ($property in $InputObject.PSObject.Properties) {
+                $hash[$property.Name] = ConvertTo-HashTable $property.Value
+            }
+            return $hash
+        }
+        else {
+            return $InputObject
+        }
+    }
+}
+
 # Main execution
 switch ($Action) {
     "Create" {
-        if (-not $ConfigPath) {
-            if (-not $ConfigName) {
-                $ConfigName = Read-Host "Enter config name (e.g., Company1)"
+        if (!$ConfigPath) {
+            if (!$ConfigName) {
+                $ConfigName = Read-Host "Enter config name (e.g. Company1)"
             }
             $ConfigPath = Join-Path $ConfigDirectory "$ConfigName.json"
         }
@@ -325,8 +302,8 @@ switch ($Action) {
     }
     
     "Update" {
-        if (-not $ConfigPath) {
-            if (-not $ConfigName) {
+        if (!$ConfigPath) {
+            if (!$ConfigName) {
                 $ConfigName = Read-Host "Enter config name"
             }
             $ConfigPath = Join-Path $ConfigDirectory "$ConfigName.json"
@@ -335,8 +312,8 @@ switch ($Action) {
     }
     
     "Test" {
-        if (-not $ConfigPath) {
-            if (-not $ConfigName) {
+        if (!$ConfigPath) {
+            if (!$ConfigName) {
                 $ConfigName = Read-Host "Enter config name"
             }
             $ConfigPath = Join-Path $ConfigDirectory "$ConfigName.json"
@@ -346,32 +323,25 @@ switch ($Action) {
     
     "List" {
         Write-Host "`nAvailable configurations:" -ForegroundColor Cyan
-        if (!(Test-Path $ConfigDirectory)) {
-            Write-Host "No configuration directory found: $ConfigDirectory" -ForegroundColor Yellow
-        }
-        else {
-            Get-ChildItem -Path $ConfigDirectory -Filter "*.json" | ForEach-Object {
-                $config = Get-Content $_.FullName -Raw | ConvertFrom-Json
-                Write-Host "`n$($_.BaseName)" -ForegroundColor Green
-                Write-Host "  File: $($_.FullName)"
-                Write-Host "  Tenant: $($config.TenantId)"
-                Write-Host "  Target: $($config.TargetMailbox)"
-                if ($config.SourceMailboxes) {
-                    Write-Host "  Sources: $($config.SourceMailboxes -join ', ')"
-                }
-                if ($config.Description) {
-                    Write-Host "  Description: $($config.Description)"
-                }
-                if ($config.CreatedDate) {
-                    Write-Host "  Created: $($config.CreatedDate)"
-                }
+        Get-ChildItem -Path $ConfigDirectory -Filter "*.json" | ForEach-Object {
+            $config = Get-Content $_.FullName -Raw | ConvertFrom-Json
+            Write-Host "`n$($_.BaseName)" -ForegroundColor Green
+            Write-Host "  File: $($_.FullName)"
+            Write-Host "  Tenant: $($config.TenantId)"
+            Write-Host "  Target: $($config.TargetMailbox)"
+            Write-Host "  Sources: $($config.SourceMailboxes -join ', ')"
+            if ($config.Description) {
+                Write-Host "  Description: $($config.Description)"
+            }
+            if ($config.CreatedDate) {
+                Write-Host "  Created: $($config.CreatedDate)"
             }
         }
     }
     
     "Show" {
-        if (-not $ConfigPath) {
-            if (-not $ConfigName) {
+        if (!$ConfigPath) {
+            if (!$ConfigName) {
                 $ConfigName = Read-Host "Enter config name"
             }
             $ConfigPath = Join-Path $ConfigDirectory "$ConfigName.json"
@@ -382,30 +352,23 @@ switch ($Action) {
     "Encrypt" {
         # Re-encrypt all configs (useful after moving to new machine)
         Write-Host "Re-encrypting all configuration files..." -ForegroundColor Cyan
-        if (!(Test-Path $ConfigDirectory)) {
-            Write-Host "No configuration directory found: $ConfigDirectory" -ForegroundColor Yellow
-        }
-        else {
-            Get-ChildItem -Path $ConfigDirectory -Filter "*.json" | ForEach-Object {
-                try {
-                    $config = Get-Content $_.FullName -Raw | ConvertFrom-Json
-                    
-                    if ($config.ClientSecret -and -not $config.ClientSecretEncrypted) {
-                        $secureString = ConvertTo-SecureString $config.ClientSecret -AsPlainText -Force
-                        $config.ClientSecretEncrypted = ConvertFrom-SecureString $secureString
-                        if ($config.PSObject.Properties['ClientSecret']) {
-                            $config.PSObject.Properties.Remove('ClientSecret')
-                        }
-                        $config | ConvertTo-Json -Depth 10 | Set-Content -Path $_.FullName -Encoding UTF8
-                        Write-Host "✓ Encrypted: $($_.Name)" -ForegroundColor Green
-                    }
-                    else {
-                        Write-Host "○ Already encrypted or no plain secret: $($_.Name)" -ForegroundColor Gray
-                    }
+        Get-ChildItem -Path $ConfigDirectory -Filter "*.json" | ForEach-Object {
+            try {
+                $config = Get-Content $_.FullName -Raw | ConvertFrom-Json | ConvertTo-HashTable
+                
+                if ($config.ClientSecret -and !$config.ClientSecretEncrypted) {
+                    $secureString = ConvertTo-SecureString $config.ClientSecret -AsPlainText -Force
+                    $config.ClientSecretEncrypted = ConvertFrom-SecureString $secureString
+                    $config.Remove('ClientSecret')
+                    $config | ConvertTo-Json -Depth 10 | Set-Content -Path $_.FullName
+                    Write-Host "✓ Encrypted: $($_.Name)" -ForegroundColor Green
                 }
-                catch {
-                    Write-Host "✗ Failed: $($_.Name) - $_" -ForegroundColor Red
+                else {
+                    Write-Host "○ Already encrypted: $($_.Name)" -ForegroundColor Gray
                 }
+            }
+            catch {
+                Write-Host "✗ Failed: $($_.Name) - $_" -ForegroundColor Red
             }
         }
     }

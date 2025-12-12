@@ -872,12 +872,20 @@ function Import-MessageToGraph {
         if ($response.StatusCode -in @(200, 201)) {
             $createdMessage = $response.Content | ConvertFrom-Json
 
-            # Update read status
-            if ($IsRead) {
-                $updateUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages/$($createdMessage.id)"
-                $updateBody = @{ isRead = $true }
-                Invoke-GraphRequest -Uri $updateUri -Method PATCH -Body $updateBody | Out-Null
+            # Update message properties: read status and mark as NOT draft
+            $updateUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages/$($createdMessage.id)"
+            $updateBody = @{
+                isRead = $IsRead
+                # Use singleValueExtendedProperties to set PR_MESSAGE_FLAGS
+                # Flag 0x01 = MSGFLAG_READ, clearing MSGFLAG_UNSENT (0x08) makes it not a draft
+                singleValueExtendedProperties = @(
+                    @{
+                        id = "Integer 0x0E07"  # PR_MESSAGE_FLAGS
+                        value = "1"           # MSGFLAG_READ (removes draft status)
+                    }
+                )
             }
+            Invoke-GraphRequest -Uri $updateUri -Method PATCH -Body $updateBody | Out-Null
 
             return $createdMessage.id
         }
@@ -904,11 +912,18 @@ function Import-MessageToGraph {
             $responseContent = $response.Content.ReadAsStringAsync().Result
             $createdMessage = $responseContent | ConvertFrom-Json
 
-            if ($IsRead) {
-                $updateUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages/$($createdMessage.id)"
-                $updateBody = @{ isRead = $true }
-                Invoke-GraphRequest -Uri $updateUri -Method PATCH -Body $updateBody | Out-Null
+            # Update message properties: read status and mark as NOT draft
+            $updateUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages/$($createdMessage.id)"
+            $updateBody = @{
+                isRead = $IsRead
+                singleValueExtendedProperties = @(
+                    @{
+                        id = "Integer 0x0E07"  # PR_MESSAGE_FLAGS
+                        value = "1"           # MSGFLAG_READ (removes draft status)
+                    }
+                )
             }
+            Invoke-GraphRequest -Uri $updateUri -Method PATCH -Body $updateBody | Out-Null
 
             $httpClient.Dispose()
             return $createdMessage.id
@@ -1046,6 +1061,19 @@ function Import-MessageToGraphBase64 {
 
     try {
         $created = Invoke-GraphRequest -Uri $uri -Method POST -Body $message
+
+        # Mark message as NOT draft using extended properties
+        $updateUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages/$($created.id)"
+        $updateBody = @{
+            singleValueExtendedProperties = @(
+                @{
+                    id = "Integer 0x0E07"  # PR_MESSAGE_FLAGS
+                    value = "1"           # MSGFLAG_READ (removes draft status)
+                }
+            )
+        }
+        Invoke-GraphRequest -Uri $updateUri -Method PATCH -Body $updateBody | Out-Null
+
         return $created.id
     }
     catch {
@@ -1374,7 +1402,7 @@ function Migrate-UserMailbox {
                             continue
                         }
 
-                        # Fetch full message
+                        # Fetch full message as string (IMAP returns text-based MIME)
                         $rawMessage = $client.FetchMessageRaw($uid)
 
                         if (!$rawMessage -or $rawMessage.Length -eq 0) {
@@ -1383,7 +1411,9 @@ function Migrate-UserMailbox {
                             continue
                         }
 
-                        $messageBytes = [System.Text.Encoding]::UTF8.GetBytes($rawMessage)
+                        # Use ISO-8859-1 encoding to preserve all bytes (1:1 mapping)
+                        # This is crucial for MIME content with binary attachments
+                        $messageBytes = [System.Text.Encoding]::GetEncoding("ISO-8859-1").GetBytes($rawMessage)
 
                         # Import to Graph
                         Write-Log "Importing: $subject" -Level Debug -User $sourceEmail

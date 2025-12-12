@@ -241,14 +241,15 @@ class SimpleImapClient {
 
         if ($useSsl) {
             if ($this.SkipCertValidation) {
-                $callback = [System.Net.Security.RemoteCertificateValidationCallback]{
-                    param($sender, $certificate, $chain, $sslPolicyErrors)
+                # Use delegate that always returns true for self-signed certs
+                $certCallback = {
+                    param($sender, $cert, $chain, $errors)
                     return $true
                 }
                 $this.SslStream = New-Object System.Net.Security.SslStream(
                     $this.TcpClient.GetStream(),
                     $false,
-                    $callback
+                    [System.Net.Security.RemoteCertificateValidationCallback]$certCallback
                 )
             }
             else {
@@ -257,7 +258,11 @@ class SimpleImapClient {
                     $false
                 )
             }
-            $this.SslStream.AuthenticateAsClient($server)
+
+            # Use TLS 1.2 explicitly for compatibility
+            $sslProtocols = [System.Security.Authentication.SslProtocols]::Tls12
+            $this.SslStream.AuthenticateAsClient($server, $null, $sslProtocols, $false)
+
             $this.Reader = New-Object System.IO.StreamReader($this.SslStream)
             $this.Writer = New-Object System.IO.StreamWriter($this.SslStream)
         }
@@ -910,6 +915,23 @@ function Get-ImapClient {
         [bool]$UseSsl,
         [bool]$SkipCertValidation
     )
+
+    # Set global certificate validation policy if skipping validation
+    if ($SkipCertValidation) {
+        # Save current callback
+        $script:originalCertCallback = [System.Net.ServicePointManager]::ServerCertificateValidationCallback
+
+        # Set callback to accept all certificates
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {
+            param($sender, $certificate, $chain, $sslPolicyErrors)
+            return $true
+        }
+
+        Write-Log "SSL certificate validation disabled (self-signed cert mode)" -Level Warning
+    }
+
+    # Ensure TLS 1.2 is enabled
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
 
     $client = [SimpleImapClient]::new($SkipCertValidation)
     $client.Connect($Server, $Port, $UseSsl)

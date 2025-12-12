@@ -1,0 +1,4 @@
+Email,Username,Password,TargetEmail
+user1@company.com,user1,UserPassword123,user1@company.onmicrosoft.com
+user2@company.com,user2,AnotherPass456,user2@company.onmicrosoft.com
+user3@company.com,user3,ThirdPass789,

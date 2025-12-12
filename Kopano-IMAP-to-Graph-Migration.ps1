@@ -524,43 +524,56 @@ class SimpleImapClient {
     [byte[]] FetchMessageBytes([int]$uid) {
         $tag = $this.GetNextTag()
         $this.Writer.WriteLine("$tag UID FETCH $uid (BODY.PEEK[])")
+        $this.Writer.Flush()
+
+        # Get the underlying stream for direct byte reading
+        $stream = if ($this.SslStream) { $this.SslStream } else { $this.TcpClient.GetStream() }
 
         $allBytes = New-Object System.Collections.Generic.List[byte]
-        $inLiteral = $false
-        $literalSize = 0
-        $literalBytesRead = 0
+        $lineBuffer = New-Object System.Collections.Generic.List[byte]
 
-        # Read response until we get the tagged response
+        # Read byte by byte to handle literal correctly
         while ($true) {
-            $line = $this.Reader.ReadLine()
-
-            if ($null -eq $line) {
+            $b = $stream.ReadByte()
+            if ($b -eq -1) {
                 throw "Connection closed unexpectedly"
             }
 
-            if ($line.StartsWith($tag)) {
-                break
-            }
+            $lineBuffer.Add([byte]$b)
 
-            # Check for literal start
-            if ($line -match '\{(\d+)\}$') {
-                $literalSize = [int]$matches[1]
-                $inLiteral = $true
+            # Check for end of line (CRLF)
+            if ($lineBuffer.Count -ge 2 -and
+                $lineBuffer[$lineBuffer.Count - 2] -eq 13 -and  # CR
+                $lineBuffer[$lineBuffer.Count - 1] -eq 10) {    # LF
 
-                # Read literal bytes
-                $buffer = New-Object byte[] $literalSize
-                $bytesRead = 0
+                # Convert line to string (without CRLF)
+                $lineBytes = $lineBuffer.ToArray()
+                $line = [System.Text.Encoding]::ASCII.GetString($lineBytes, 0, $lineBytes.Length - 2)
+                $lineBuffer.Clear()
 
-                while ($bytesRead -lt $literalSize) {
-                    $chunk = $this.SslStream.Read($buffer, $bytesRead, $literalSize - $bytesRead)
-                    if ($chunk -eq 0) {
-                        throw "Connection closed while reading literal"
-                    }
-                    $bytesRead += $chunk
+                # Check if this is the tagged response (end)
+                if ($line.StartsWith($tag)) {
+                    break
                 }
 
-                $allBytes.AddRange($buffer)
-                $inLiteral = $false
+                # Check for literal start: {size}
+                if ($line -match '\{(\d+)\}$') {
+                    $literalSize = [int]$matches[1]
+
+                    # Read literal bytes directly
+                    $buffer = New-Object byte[] $literalSize
+                    $bytesRead = 0
+
+                    while ($bytesRead -lt $literalSize) {
+                        $chunk = $stream.Read($buffer, $bytesRead, $literalSize - $bytesRead)
+                        if ($chunk -eq 0) {
+                            throw "Connection closed while reading literal"
+                        }
+                        $bytesRead += $chunk
+                    }
+
+                    $allBytes.AddRange($buffer)
+                }
             }
         }
 
@@ -852,12 +865,12 @@ function Import-MessageToGraph {
     )
 
     # Graph API supports importing MIME messages
-    # Use the messages endpoint with MIME content
+    # First create in root messages, then move to target folder (more reliable)
 
-    $uri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/mailFolders/$FolderId/messages"
     $token = Get-GraphToken
+    $createUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages"
 
-    # Method 1: Use Invoke-WebRequest with proper encoding (like reference script)
+    # Method 1: Direct MIME import (like reference script)
     try {
         $headers = @{
             "Authorization" = "Bearer $token"
@@ -867,20 +880,42 @@ function Import-MessageToGraph {
         # Convert bytes to string preserving all byte values (ISO-8859-1 is 1:1 mapping)
         $mimeString = [System.Text.Encoding]::GetEncoding("ISO-8859-1").GetString($MimeContent)
 
-        $response = Invoke-WebRequest -Method POST -Uri $uri -Headers $headers -Body $mimeString -UseBasicParsing
+        $response = Invoke-WebRequest -Method POST -Uri $createUri -Headers $headers -Body $mimeString -UseBasicParsing
 
         if ($response.StatusCode -in @(200, 201)) {
             $createdMessage = $response.Content | ConvertFrom-Json
+            $messageId = $createdMessage.id
+
+            # Move to target folder if not Inbox
+            if ($FolderId) {
+                try {
+                    $moveUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages/$messageId/move"
+                    $moveBody = @{ destinationId = $FolderId }
+                    $movedMessage = Invoke-GraphRequest -Uri $moveUri -Method POST -Body $moveBody
+                    $messageId = $movedMessage.id
+                }
+                catch {
+                    Write-Log "Failed to move message to target folder: $_" -Level Warning
+                }
+            }
 
             # Update message with original date and mark as NOT draft
-            Set-MessageDateAndFlags -TargetMailbox $TargetMailbox -MessageId $createdMessage.id -ReceivedDate $ReceivedDate -IsRead $IsRead
+            Set-MessageDateAndFlags -TargetMailbox $TargetMailbox -MessageId $messageId -ReceivedDate $ReceivedDate -IsRead $IsRead
 
-            return $createdMessage.id
+            return $messageId
         }
     }
     catch {
         $errorMsg = $_.Exception.Message
-        Write-Log "MIME import method 1 failed: $errorMsg" -Level Debug
+        $errorDetails = ""
+        if ($_.Exception.Response) {
+            try {
+                $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                $errorDetails = $reader.ReadToEnd()
+                $reader.Close()
+            } catch {}
+        }
+        Write-Log "MIME import method 1 failed: $errorMsg $errorDetails" -Level Debug
     }
 
     # Method 2: Try with HttpClient and raw bytes
@@ -894,27 +929,45 @@ function Import-MessageToGraph {
         $content = New-Object System.Net.Http.ByteArrayContent(,$MimeContent)
         $content.Headers.ContentType = New-Object System.Net.Http.Headers.MediaTypeHeaderValue("text/plain")
 
-        $response = $httpClient.PostAsync($uri, $content).Result
+        $response = $httpClient.PostAsync($createUri, $content).Result
 
         if ($response.IsSuccessStatusCode) {
             $responseContent = $response.Content.ReadAsStringAsync().Result
             $createdMessage = $responseContent | ConvertFrom-Json
+            $messageId = $createdMessage.id
+
+            # Move to target folder if specified
+            if ($FolderId) {
+                try {
+                    $moveUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages/$messageId/move"
+                    $moveBody = @{ destinationId = $FolderId }
+                    $movedMessage = Invoke-GraphRequest -Uri $moveUri -Method POST -Body $moveBody
+                    $messageId = $movedMessage.id
+                }
+                catch {
+                    Write-Log "Failed to move message to target folder: $_" -Level Warning
+                }
+            }
 
             # Update message with original date and mark as NOT draft
-            Set-MessageDateAndFlags -TargetMailbox $TargetMailbox -MessageId $createdMessage.id -ReceivedDate $ReceivedDate -IsRead $IsRead
+            Set-MessageDateAndFlags -TargetMailbox $TargetMailbox -MessageId $messageId -ReceivedDate $ReceivedDate -IsRead $IsRead
 
             $httpClient.Dispose()
-            return $createdMessage.id
+            return $messageId
+        }
+        else {
+            $errorContent = $response.Content.ReadAsStringAsync().Result
+            Write-Log "MIME import method 2 failed: $($response.StatusCode) - $errorContent" -Level Debug
         }
 
         $httpClient.Dispose()
     }
     catch {
-        Write-Log "MIME import method 2 failed: $_" -Level Debug
+        Write-Log "MIME import method 2 exception: $_" -Level Debug
     }
 
     # Method 3: Fallback to wrapper with .eml attachment
-    Write-Log "Using fallback method (wrapper with .eml attachment)" -Level Debug
+    Write-Log "Using fallback method (wrapper with .eml attachment)" -Level Warning
     return Import-MessageToGraphBase64 -TargetMailbox $TargetMailbox -FolderId $FolderId -MimeContent $MimeContent -ReceivedDate $ReceivedDate -IsRead $IsRead
 }
 
@@ -1416,18 +1469,14 @@ function Migrate-UserMailbox {
                             continue
                         }
 
-                        # Fetch full message as string (IMAP returns text-based MIME)
-                        $rawMessage = $client.FetchMessageRaw($uid)
+                        # Fetch full message as raw bytes (preserves binary content correctly)
+                        $messageBytes = $client.FetchMessageBytes($uid)
 
-                        if (!$rawMessage -or $rawMessage.Length -eq 0) {
+                        if (!$messageBytes -or $messageBytes.Length -eq 0) {
                             Write-Log "Empty message content for UID $uid, skipping" -Level Warning -User $sourceEmail
                             $userStats.Skipped++
                             continue
                         }
-
-                        # Use ISO-8859-1 encoding to preserve all bytes (1:1 mapping)
-                        # This is crucial for MIME content with binary attachments
-                        $messageBytes = [System.Text.Encoding]::GetEncoding("ISO-8859-1").GetBytes($rawMessage)
 
                         # Import to Graph
                         Write-Log "Importing: $subject" -Level Debug -User $sourceEmail

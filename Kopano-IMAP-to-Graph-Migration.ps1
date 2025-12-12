@@ -1246,20 +1246,21 @@ function Migrate-UserMailbox {
         # Process each folder
         foreach ($folder in $folders) {
             $folderName = $folder.Name
+            $folderDisplayName = ConvertFrom-ImapUtf7 -EncodedString $folderName  # Decoded for display
 
-            # Check exclusions
-            if (Test-FolderExcluded -FolderName $folderName) {
-                Write-Log "Skipping excluded folder: $folderName" -Level Debug -User $sourceEmail
+            # Check exclusions (check both encoded and decoded names)
+            if ((Test-FolderExcluded -FolderName $folderName) -or (Test-FolderExcluded -FolderName $folderDisplayName)) {
+                Write-Log "Skipping excluded folder: $folderDisplayName" -Level Debug -User $sourceEmail
                 continue
             }
 
             # Check for \Noselect flag
             if ($folder.Flags -match '\\Noselect') {
-                Write-Log "Skipping non-selectable folder: $folderName" -Level Debug -User $sourceEmail
+                Write-Log "Skipping non-selectable folder: $folderDisplayName" -Level Debug -User $sourceEmail
                 continue
             }
 
-            Write-Log "Processing folder: $folderName" -Level Info -User $sourceEmail
+            Write-Log "Processing folder: $folderDisplayName" -Level Info -User $sourceEmail
             $userStats.Folders++
 
             try {
@@ -1267,12 +1268,12 @@ function Migrate-UserMailbox {
                 $folderInfo = $client.SelectFolder($folderName)
 
                 if (!$folderInfo.Success) {
-                    Write-Log "Failed to select folder: $folderName" -Level Warning -User $sourceEmail
+                    Write-Log "Failed to select folder: $folderDisplayName" -Level Warning -User $sourceEmail
                     continue
                 }
 
                 if ($folderInfo.Exists -eq 0) {
-                    Write-Log "Folder is empty: $folderName" -Level Debug -User $sourceEmail
+                    Write-Log "Folder is empty: $folderDisplayName" -Level Debug -User $sourceEmail
                     continue
                 }
 
@@ -1283,7 +1284,7 @@ function Migrate-UserMailbox {
                 $messageUids = $client.SearchMessages($searchCriteria)
 
                 if ($messageUids.Count -eq 0) {
-                    Write-Log "No messages match criteria in folder: $folderName" -Level Debug -User $sourceEmail
+                    Write-Log "No messages match criteria in folder: $folderDisplayName" -Level Debug -User $sourceEmail
                     continue
                 }
 
@@ -1388,7 +1389,7 @@ function Migrate-UserMailbox {
                 }
             }
             catch {
-                Write-Log "Error processing folder $folderName : $_" -Level Error -User $sourceEmail
+                Write-Log "Error processing folder $folderDisplayName : $_" -Level Error -User $sourceEmail
 
                 if (!$ContinueOnError) {
                     throw

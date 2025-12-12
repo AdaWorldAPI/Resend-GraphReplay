@@ -689,12 +689,15 @@ function Invoke-GraphRequest {
     }
 
     if ($Body) {
-        $params.ContentType = $ContentType
         if ($ContentType -eq "application/json" -and $Body -isnot [string]) {
-            $params.Body = $Body | ConvertTo-Json -Depth 20 -Compress
+            # Convert to JSON and encode as UTF-8 bytes
+            $jsonString = $Body | ConvertTo-Json -Depth 20 -Compress
+            $params.Body = [System.Text.Encoding]::UTF8.GetBytes($jsonString)
+            $params.ContentType = "application/json; charset=utf-8"
         }
         else {
             $params.Body = $Body
+            $params.ContentType = $ContentType
         }
     }
 
@@ -848,27 +851,52 @@ function Import-MessageToGraph {
         [bool]$IsRead = $true
     )
 
-    # Graph API supports importing MIME messages with received date preservation
-    # We'll use the messages endpoint with raw MIME content
+    # Graph API supports importing MIME messages
+    # Use the messages endpoint with MIME content
 
     $uri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/mailFolders/$FolderId/messages"
-
     $token = Get-GraphToken
 
+    # Method 1: Use Invoke-WebRequest with proper encoding (like reference script)
     try {
-        # Use HttpClient for proper binary handling
+        $headers = @{
+            "Authorization" = "Bearer $token"
+            "Content-Type"  = "text/plain"
+        }
+
+        # Convert bytes to string preserving all byte values (ISO-8859-1 is 1:1 mapping)
+        $mimeString = [System.Text.Encoding]::GetEncoding("ISO-8859-1").GetString($MimeContent)
+
+        $response = Invoke-WebRequest -Method POST -Uri $uri -Headers $headers -Body $mimeString -UseBasicParsing
+
+        if ($response.StatusCode -in @(200, 201)) {
+            $createdMessage = $response.Content | ConvertFrom-Json
+
+            # Update read status
+            if ($IsRead) {
+                $updateUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages/$($createdMessage.id)"
+                $updateBody = @{ isRead = $true }
+                Invoke-GraphRequest -Uri $updateUri -Method PATCH -Body $updateBody | Out-Null
+            }
+
+            return $createdMessage.id
+        }
+    }
+    catch {
+        $errorMsg = $_.Exception.Message
+        Write-Log "MIME import method 1 failed: $errorMsg" -Level Debug
+    }
+
+    # Method 2: Try with HttpClient and raw bytes
+    try {
         Add-Type -AssemblyName System.Net.Http
 
         $httpClient = New-Object System.Net.Http.HttpClient
         $httpClient.DefaultRequestHeaders.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", $token)
-
-        # Important: Set timeout for large messages
         $httpClient.Timeout = [TimeSpan]::FromMinutes(5)
 
-        # Create content - Graph API expects text/plain for MIME import
-        # But we need to send the raw bytes properly
         $content = New-Object System.Net.Http.ByteArrayContent(,$MimeContent)
-        $content.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse("text/plain; charset=utf-8")
+        $content.Headers.ContentType = New-Object System.Net.Http.Headers.MediaTypeHeaderValue("text/plain")
 
         $response = $httpClient.PostAsync($uri, $content).Result
 
@@ -876,75 +904,24 @@ function Import-MessageToGraph {
             $responseContent = $response.Content.ReadAsStringAsync().Result
             $createdMessage = $responseContent | ConvertFrom-Json
 
-            # Update the message to set read status
-            $updateUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages/$($createdMessage.id)"
-            $updateBody = @{ isRead = $IsRead }
-            Invoke-GraphRequest -Uri $updateUri -Method PATCH -Body $updateBody | Out-Null
+            if ($IsRead) {
+                $updateUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages/$($createdMessage.id)"
+                $updateBody = @{ isRead = $true }
+                Invoke-GraphRequest -Uri $updateUri -Method PATCH -Body $updateBody | Out-Null
+            }
 
             $httpClient.Dispose()
             return $createdMessage.id
         }
-        else {
-            $statusCode = [int]$response.StatusCode
-            $errorContent = $response.Content.ReadAsStringAsync().Result
-            $httpClient.Dispose()
 
-            Write-Log "Raw MIME failed (HTTP $statusCode), trying alternative method..." -Level Debug
-
-            # Try alternative: Send as ASCII-safe string
-            return Import-MessageToGraphMimeString -TargetMailbox $TargetMailbox -FolderId $FolderId -MimeContent $MimeContent -IsRead $IsRead
-        }
+        $httpClient.Dispose()
     }
     catch {
-        Write-Log "MIME import exception, trying alternative method: $_" -Level Debug
-
-        return Import-MessageToGraphMimeString -TargetMailbox $TargetMailbox -FolderId $FolderId -MimeContent $MimeContent -IsRead $IsRead
-    }
-}
-
-function Import-MessageToGraphMimeString {
-    <#
-    .SYNOPSIS
-    Alternative method sending MIME as string with proper encoding
-    #>
-    param(
-        [string]$TargetMailbox,
-        [string]$FolderId,
-        [byte[]]$MimeContent,
-        [bool]$IsRead = $true
-    )
-
-    $uri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/mailFolders/$FolderId/messages"
-    $token = Get-GraphToken
-
-    try {
-        # Try ISO-8859-1 encoding which preserves byte values
-        $mimeString = [System.Text.Encoding]::GetEncoding("ISO-8859-1").GetString($MimeContent)
-
-        $headers = @{
-            "Authorization" = "Bearer $token"
-            "Content-Type"  = "text/plain"
-        }
-
-        # Use Invoke-WebRequest with explicit encoding
-        $response = Invoke-WebRequest -Method POST -Uri $uri -Headers $headers -Body $mimeString -UseBasicParsing
-
-        if ($response.StatusCode -eq 201 -or $response.StatusCode -eq 200) {
-            $createdMessage = $response.Content | ConvertFrom-Json
-
-            # Update read status
-            $updateUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages/$($createdMessage.id)"
-            $updateBody = @{ isRead = $IsRead }
-            Invoke-GraphRequest -Uri $updateUri -Method PATCH -Body $updateBody | Out-Null
-
-            return $createdMessage.id
-        }
-    }
-    catch {
-        Write-Log "MIME string method failed: $_" -Level Debug
+        Write-Log "MIME import method 2 failed: $_" -Level Debug
     }
 
-    # Last resort: Create message with .eml attachment
+    # Method 3: Fallback to wrapper with .eml attachment
+    Write-Log "Using fallback method (wrapper with .eml attachment)" -Level Debug
     return Import-MessageToGraphBase64 -TargetMailbox $TargetMailbox -FolderId $FolderId -MimeContent $MimeContent -IsRead $IsRead
 }
 

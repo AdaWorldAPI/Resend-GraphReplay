@@ -31,10 +31,24 @@ $ImapConfig = @{
 }
 
 # ============================================
-# User List Configuration
+# User List Configuration (CSV Mode)
 # ============================================
 $UserConfig = @{
     UserCsvPath = ".\users.csv"                     # CSV with Email,Username,Password,TargetEmail
+}
+
+# ============================================
+# Single User Test Configuration
+# Set $UseTestMode = $true to test with single user
+# ============================================
+$UseTestMode = $false                               # Set to $true to enable test mode
+
+$TestConfig = @{
+    TestMode     = $true
+    TestSource   = "testuser@kopano.local"          # Source IMAP email address
+    TestTarget   = "testuser@company.onmicrosoft.com" # Target M365 mailbox
+    TestUsername = "testuser"                       # IMAP username (optional, defaults to TestSource)
+    TestPassword = "YourTestPassword123"            # IMAP password
 }
 
 # ============================================
@@ -102,8 +116,11 @@ $LoggingOptions = @{
 # ============================================
 $MigrationParams = @{}
 
+# Select user config based on mode
+$SelectedUserConfig = if ($UseTestMode) { $TestConfig } else { $UserConfig }
+
 # Merge all configuration hashtables
-@($GraphConfig, $ImapConfig, $UserConfig, $MigrationOptions, $DateFilter, $ProcessingOptions, $LoggingOptions) | ForEach-Object {
+@($GraphConfig, $ImapConfig, $SelectedUserConfig, $MigrationOptions, $DateFilter, $ProcessingOptions, $LoggingOptions) | ForEach-Object {
     $_.GetEnumerator() | ForEach-Object {
         if ($null -ne $_.Value -and $_.Value -ne '') {
             $MigrationParams[$_.Key] = $_.Value
@@ -120,7 +137,17 @@ Write-Host "============================================" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "IMAP Server:    $($ImapConfig.ImapServer):$($ImapConfig.ImapPort)" -ForegroundColor White
 Write-Host "SSL Enabled:    $($ImapConfig.ImapUseSsl)" -ForegroundColor White
-Write-Host "User CSV:       $($UserConfig.UserCsvPath)" -ForegroundColor White
+
+if ($UseTestMode) {
+    Write-Host "Mode:           TEST (Single User)" -ForegroundColor Yellow
+    Write-Host "Source:         $($TestConfig.TestSource)" -ForegroundColor White
+    Write-Host "Target:         $($TestConfig.TestTarget)" -ForegroundColor White
+}
+else {
+    Write-Host "Mode:           CSV (Bulk Migration)" -ForegroundColor White
+    Write-Host "User CSV:       $($UserConfig.UserCsvPath)" -ForegroundColor White
+}
+
 Write-Host "Log Path:       $($LoggingOptions.LogPath)" -ForegroundColor White
 Write-Host ""
 

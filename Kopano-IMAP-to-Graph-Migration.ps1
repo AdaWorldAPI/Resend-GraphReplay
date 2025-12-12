@@ -32,9 +32,15 @@ param(
 
     [switch]$ImapSkipCertValidation,        # Skip SSL certificate validation (for self-signed certs)
 
-    # === User List ===
-    [Parameter(Mandatory)]
+    # === User List (CSV mode) ===
     [string]$UserCsvPath,                   # CSV file with: Email,Username,Password,TargetEmail (optional)
+
+    # === Single User Test Mode ===
+    [string]$TestSource,                    # Test: Source IMAP email/username
+    [string]$TestTarget,                    # Test: Target M365 mailbox
+    [string]$TestUsername,                  # Test: IMAP username (if different from TestSource)
+    [string]$TestPassword,                  # Test: IMAP password
+    [switch]$TestMode,                      # Enable single-user test mode
 
     # === Migration Options ===
     [string[]]$FoldersToMigrate,            # Specific folders to migrate (empty = all folders)
@@ -1206,6 +1212,22 @@ try {
     Write-Log "Tenant ID: $TenantId" -Level Info
     Write-Log "Client ID: $ClientId" -Level Info
 
+    # === Validate Parameters ===
+    if ($TestMode -or $TestSource -or $TestTarget -or $TestPassword) {
+        # Test mode - validate test parameters
+        if (!$TestSource) { throw "TestSource is required in test mode" }
+        if (!$TestTarget) { throw "TestTarget is required in test mode" }
+        if (!$TestPassword) { throw "TestPassword is required in test mode" }
+
+        $TestMode = $true  # Ensure flag is set
+        Write-Log "*** TEST MODE - Single user migration ***" -Level Warning
+        Write-Log "Source: $TestSource" -Level Info
+        Write-Log "Target: $TestTarget" -Level Info
+    }
+    elseif (!$UserCsvPath) {
+        throw "Either -UserCsvPath or test mode parameters (-TestSource, -TestTarget, -TestPassword) are required"
+    }
+
     if ($WhatIf) {
         Write-Log "*** WHATIF MODE - No actual migration will occur ***" -Level Warning
     }
@@ -1222,8 +1244,22 @@ try {
     Write-Log "Testing Graph API connectivity..." -Level Info
     $null = Get-GraphToken
 
-    # Load user list
-    $users = Import-UserCsv -CsvPath $UserCsvPath
+    # Load user list (CSV or Test mode)
+    $users = @()
+    if ($TestMode) {
+        # Create single test user object
+        $testUser = [PSCustomObject]@{
+            Email       = $TestSource
+            Username    = if ($TestUsername) { $TestUsername } else { $TestSource }
+            Password    = $TestPassword
+            TargetEmail = $TestTarget
+        }
+        $users = @($testUser)
+        Write-Log "Test mode: Single user configured" -Level Info
+    }
+    else {
+        $users = Import-UserCsv -CsvPath $UserCsvPath
+    }
     $script:stats.TotalUsers = $users.Count
 
     # Load previous state if resuming

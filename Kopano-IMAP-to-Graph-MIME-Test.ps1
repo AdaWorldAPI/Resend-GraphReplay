@@ -251,8 +251,8 @@ function Get-OrCreateMailFolder {
 }
 
 # ================================
-# METHOD A: Direct MIME POST to /messages (not /mailFolders/x/messages!)
-# Content-Type: text/plain with raw MIME string
+# METHOD A: Direct MIME POST to /messages with Base64
+# Graph API expects MIME content as Base64-encoded string
 # ================================
 
 function Import-MimeMethodA {
@@ -265,12 +265,11 @@ function Import-MimeMethodA {
 
     $token = Get-GraphToken
     
-    # IMPORTANT: MIME import goes to /messages directly, NOT /mailFolders/{id}/messages
-    # The folder endpoint only accepts JSON
+    # MIME import goes to /messages directly
     $uri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages"
     
-    # Convert MIME bytes to string (UTF-8)
-    $mimeString = [System.Text.Encoding]::UTF8.GetString($MimeContent)
+    # BASE64 ENCODE the MIME content - this is what Graph expects!
+    $mimeBase64 = [Convert]::ToBase64String($MimeContent)
     
     Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
     
@@ -278,8 +277,8 @@ function Import-MimeMethodA {
     $httpClient.DefaultRequestHeaders.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", $token)
     $httpClient.Timeout = [TimeSpan]::FromMinutes(5)
     
-    # Send as text/plain with UTF-8 encoding
-    $content = New-Object System.Net.Http.StringContent($mimeString, [System.Text.Encoding]::UTF8, "text/plain")
+    # Send Base64-encoded MIME with text/plain content type
+    $content = New-Object System.Net.Http.StringContent($mimeBase64, [System.Text.Encoding]::UTF8, "text/plain")
     
     $response = $httpClient.PostAsync($uri, $content).Result
     $responseBody = $response.Content.ReadAsStringAsync().Result
@@ -331,8 +330,8 @@ function Import-MimeMethodA {
 }
 
 # ================================
-# METHOD B: Raw bytes with different content types
-# Try application/octet-stream and message/rfc822
+# METHOD B: Try different approaches - JSON body with mimeContent property
+# This is how Graph API documentation suggests for programmatic creation
 # ================================
 
 function Import-MimeMethodB {
@@ -344,90 +343,93 @@ function Import-MimeMethodB {
     )
 
     $token = Get-GraphToken
+    $headers = @{ 
+        "Authorization" = "Bearer $token"
+        "Content-Type" = "application/json"
+    }
     
-    # MIME import must go to /messages endpoint, not folder-specific
-    $uri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages"
-    $betaUri = "https://graph.microsoft.com/beta/users/$TargetMailbox/messages"
+    # Base64 encode the MIME
+    $mimeBase64 = [Convert]::ToBase64String($MimeContent)
     
-    Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
+    # Method B: Use PATCH with mimeContent property on a draft
+    # First create an empty draft, then update with MIME content
     
-    $httpClient = New-Object System.Net.Http.HttpClient
-    $httpClient.DefaultRequestHeaders.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", $token)
-    $httpClient.Timeout = [TimeSpan]::FromMinutes(5)
-    
-    $response = $null
-    $responseBody = ""
-    
-    # Try 1: message/rfc822 content type (most semantically correct for email)
     try {
-        $byteContent = New-Object System.Net.Http.ByteArrayContent(,$MimeContent)
-        $byteContent.Headers.ContentType = New-Object System.Net.Http.Headers.MediaTypeHeaderValue("message/rfc822")
+        # Step 1: Create minimal draft
+        $draftBody = @{
+            subject = "Temp"
+        } | ConvertTo-Json
         
-        $response = $httpClient.PostAsync($uri, $byteContent).Result
+        $uri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages"
+        $draft = Invoke-RestMethod -Uri $uri -Method POST -Headers $headers -Body $draftBody -ContentType "application/json"
+        $draftId = $draft.id
+        
+        # Step 2: Update with MIME content using $value endpoint
+        # The $value endpoint accepts raw content
+        $valueUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages/$draftId/`$value"
+        
+        Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
+        $httpClient = New-Object System.Net.Http.HttpClient
+        $httpClient.DefaultRequestHeaders.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", $token)
+        
+        # PUT raw MIME bytes to $value endpoint
+        $byteContent = New-Object System.Net.Http.ByteArrayContent(,$MimeContent)
+        $byteContent.Headers.ContentType = New-Object System.Net.Http.Headers.MediaTypeHeaderValue("text/plain")
+        
+        $response = $httpClient.PutAsync($valueUri, $byteContent).Result
         $responseBody = $response.Content.ReadAsStringAsync().Result
         
-        if (!$response.IsSuccessStatusCode) {
-            # Try beta endpoint
-            $byteContent2 = New-Object System.Net.Http.ByteArrayContent(,$MimeContent)
-            $byteContent2.Headers.ContentType = New-Object System.Net.Http.Headers.MediaTypeHeaderValue("message/rfc822")
-            $response = $httpClient.PostAsync($betaUri, $byteContent2).Result
-            $responseBody = $response.Content.ReadAsStringAsync().Result
-        }
-    }
-    catch { }
-    
-    # Try 2: application/octet-stream if rfc822 failed
-    if (!$response -or !$response.IsSuccessStatusCode) {
-        try {
-            $byteContent3 = New-Object System.Net.Http.ByteArrayContent(,$MimeContent)
-            $byteContent3.Headers.ContentType = New-Object System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream")
+        $httpClient.Dispose()
+        
+        if ($response.IsSuccessStatusCode) {
+            # Get updated message
+            $getUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages/$draftId"
+            $updatedMessage = Invoke-RestMethod -Uri $getUri -Headers $headers
             
-            $response = $httpClient.PostAsync($uri, $byteContent3).Result
-            $responseBody = $response.Content.ReadAsStringAsync().Result
-        }
-        catch { }
-    }
-    
-    $httpClient.Dispose()
-    
-    if ($response -and $response.IsSuccessStatusCode) {
-        $createdMessage = $responseBody | ConvertFrom-Json
-        $messageId = $createdMessage.id
-        
-        # Move to target folder
-        if ($FolderId) {
-            try {
-                $moveUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages/$messageId/move"
-                $headers = @{ "Authorization" = "Bearer $token" }
-                $moveBody = @{ destinationId = $FolderId } | ConvertTo-Json
-                $moved = Invoke-RestMethod -Uri $moveUri -Method POST -Headers $headers -Body $moveBody -ContentType "application/json"
-                $messageId = $moved.id
+            $messageId = $updatedMessage.id
+            
+            # Move to target folder
+            if ($FolderId) {
+                try {
+                    $moveUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages/$messageId/move"
+                    $moveBody = @{ destinationId = $FolderId } | ConvertTo-Json
+                    $moved = Invoke-RestMethod -Uri $moveUri -Method POST -Headers $headers -Body $moveBody -ContentType "application/json"
+                    $messageId = $moved.id
+                }
+                catch { }
             }
-            catch { }
-        }
-        
-        # Mark as read
-        if ($IsRead) {
-            try {
-                $updateUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages/$messageId"
-                $headers = @{ "Authorization" = "Bearer $token" }
-                Invoke-RestMethod -Uri $updateUri -Method PATCH -Headers $headers -Body '{"isRead":true}' -ContentType "application/json" | Out-Null
+            
+            # Mark as read
+            if ($IsRead) {
+                try {
+                    $updateUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages/$messageId"
+                    Invoke-RestMethod -Uri $updateUri -Method PATCH -Headers $headers -Body '{"isRead":true}' -ContentType "application/json" | Out-Null
+                }
+                catch { }
             }
-            catch { }
+            
+            return @{
+                Success = $true
+                MessageId = $messageId
+                IsDraft = $updatedMessage.isDraft
+                Subject = $updatedMessage.subject
+                From = $updatedMessage.from.emailAddress.address
+            }
         }
-        
-        return @{
-            Success = $true
-            MessageId = $messageId
-            IsDraft = $createdMessage.isDraft
-            Subject = $createdMessage.subject
-            From = $createdMessage.from.emailAddress.address
+        else {
+            # Cleanup draft
+            try { Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages/$draftId" -Method DELETE -Headers $headers | Out-Null } catch { }
+            
+            return @{
+                Success = $false
+                Error = "$($response.StatusCode): $responseBody"
+            }
         }
     }
-    else {
+    catch {
         return @{
             Success = $false
-            Error = if ($response) { "$($response.StatusCode): $responseBody" } else { "No response" }
+            Error = $_.Exception.Message
         }
     }
 }

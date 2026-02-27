@@ -1,20 +1,25 @@
 <#
 .SYNOPSIS
-    Kopano IMAP to Exchange Online Migration (EWS Version)
+    Kopano IMAP to Microsoft 365 Migration (EWS Version)
     
 .DESCRIPTION
-    Migrates emails from Kopano IMAP server to Microsoft 365 via EWS.
-    Uses direct MIME import for 1:1 email preservation.
+    Migrates emails from Kopano IMAP to M365 using:
+    - MailKit for IMAP source (reliable IMAP client)
+    - EWS for M365 target (true MIME import, no conversion)
+    
+    This is the cleanest approach - MIME bytes go directly into Exchange
+    without any parsing or JSON conversion.
     
 .NOTES
     Requires: 
-    - lib/MailKit.dll, lib/MimeKit.dll, lib/BouncyCastle.Crypto.dll (for IMAP)
-    - Azure AD App with MailboxItem.ImportExport.All permission
+    - lib/MailKit.dll, lib/MimeKit.dll, lib/BouncyCastle.Crypto.dll
+    - lib/Microsoft.Exchange.WebServices.dll
+    - Azure AD App with MailboxItem.ImportExport.All (Application permission)
 #>
 
 [CmdletBinding()]
 param(
-    # === Microsoft Graph/EWS Authentication ===
+    # === Azure AD Authentication ===
     [Parameter(Mandatory)]
     [string]$TenantId,
 
@@ -138,16 +143,18 @@ function Write-Log {
 }
 
 # ================================
-# MailKit Loading (for IMAP source)
+# Load Assemblies
 # ================================
 
-function Initialize-MailKit {
+function Initialize-Libraries {
     $libPath = Join-Path $PSScriptRoot "lib"
     
+    # Required DLLs in load order
     $dlls = @(
         "BouncyCastle.Crypto.dll",
         "MimeKit.dll",
-        "MailKit.dll"
+        "MailKit.dll",
+        "Microsoft.Exchange.WebServices.dll"
     )
     
     foreach ($dll in $dlls) {
@@ -177,7 +184,7 @@ function Initialize-MailKit {
         }
     }
     
-    Write-Log "MailKit libraries loaded" -Level Success
+    Write-Log "All libraries loaded successfully" -Level Success
     return $true
 }
 
@@ -215,226 +222,156 @@ function Get-OAuthToken {
 }
 
 # ================================
-# EWS Functions
+# EWS Service
 # ================================
 
-function Get-EwsFolderId {
+function Get-EwsService {
+    param([string]$TargetMailbox)
+    
+    $token = Get-OAuthToken
+    
+    $service = New-Object Microsoft.Exchange.WebServices.Data.ExchangeService([Microsoft.Exchange.WebServices.Data.ExchangeVersion]::Exchange2016)
+    
+    # OAuth credentials
+    $service.Credentials = New-Object Microsoft.Exchange.WebServices.Data.OAuthCredentials($token)
+    
+    # EWS URL
+    $service.Url = New-Object Uri("https://outlook.office365.com/EWS/Exchange.asmx")
+    
+    # Impersonate target mailbox
+    $service.ImpersonatedUserId = New-Object Microsoft.Exchange.WebServices.Data.ImpersonatedUserId(
+        [Microsoft.Exchange.WebServices.Data.ConnectingIdType]::SmtpAddress,
+        $TargetMailbox
+    )
+    
+    # Set headers for better compatibility
+    $service.HttpHeaders.Add("X-AnchorMailbox", $TargetMailbox)
+    
+    return $service
+}
+
+# ================================
+# EWS Folder Management
+# ================================
+
+function Get-OrCreateEwsFolder {
     param(
-        [string]$TargetMailbox,
+        $Service,
         [string]$FolderPath,
-        [string]$Token,
         [hashtable]$FolderCache = @{}
     )
-
-    $cacheKey = "$TargetMailbox|$FolderPath"
+    
+    $cacheKey = $FolderPath.ToLower()
     if ($FolderCache.ContainsKey($cacheKey)) {
         return $FolderCache[$cacheKey]
     }
-
-    # Well-known folder mapping
-    $wellKnownFolders = @{
-        'INBOX'              = 'inbox'
-        'Sent'               = 'sentitems'
-        'Sent Items'         = 'sentitems'
-        'Gesendete Objekte'  = 'sentitems'
-        'Drafts'             = 'drafts'
-        'Entwürfe'           = 'drafts'
-        'Trash'              = 'deleteditems'
-        'Deleted Items'      = 'deleteditems'
-        'Gelöschte Objekte'  = 'deleteditems'
-        'Junk'               = 'junkemail'
-        'Junk E-Mail'        = 'junkemail'
-        'Archive'            = 'archive'
-        'Archiv'             = 'archive'
-        'Outbox'             = 'outbox'
-        'Postausgang'        = 'outbox'
-    }
-
+    
     $normalizedPath = $FolderPath -replace '/', '\' -replace '\\+', '\'
     $parts = $normalizedPath.Split('\') | Where-Object { $_ -ne '' }
     
-    if ($parts.Count -eq 0) {
-        return $null
+    # Well-known folder mapping
+    $wellKnownFolders = @{
+        'INBOX'              = [Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::Inbox
+        'Sent'               = [Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::SentItems
+        'Sent Items'         = [Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::SentItems
+        'Gesendete Objekte'  = [Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::SentItems
+        'Gesendete Elemente' = [Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::SentItems
+        'Drafts'             = [Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::Drafts
+        'Entwürfe'           = [Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::Drafts
+        'Trash'              = [Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::DeletedItems
+        'Deleted Items'      = [Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::DeletedItems
+        'Gelöschte Objekte'  = [Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::DeletedItems
+        'Gelöschte Elemente' = [Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::DeletedItems
+        'Junk'               = [Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::JunkEmail
+        'Junk E-Mail'        = [Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::JunkEmail
+        'Junk-E-Mail'        = [Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::JunkEmail
+        'Archive'            = [Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::Inbox  # Fallback
+        'Archiv'             = [Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::Inbox
+        'Postausgang'        = [Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::Outbox
     }
-
-    $rootFolder = $parts[0]
-    $parentFolderId = $null
-
-    # Check if root is a well-known folder
-    if ($wellKnownFolders.ContainsKey($rootFolder)) {
-        $wellKnownName = $wellKnownFolders[$rootFolder]
+    
+    $currentFolderId = $null
+    
+    for ($i = 0; $i -lt $parts.Count; $i++) {
+        $folderName = $parts[$i]
         
-        # Get well-known folder via EWS
-        $ewsUrl = "https://outlook.office365.com/EWS/Exchange.asmx"
+        # Check well-known folder at root
+        if ($i -eq 0 -and $wellKnownFolders.ContainsKey($folderName)) {
+            $wellKnown = $wellKnownFolders[$folderName]
+            $currentFolderId = New-Object Microsoft.Exchange.WebServices.Data.FolderId($wellKnown)
+            continue
+        }
         
-        $getFolderXml = @"
-<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-               xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
-               xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types"
-               xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
-  <soap:Header>
-    <t:ExchangeImpersonation>
-      <t:ConnectingSID>
-        <t:SmtpAddress>$TargetMailbox</t:SmtpAddress>
-      </t:ConnectingSID>
-    </t:ExchangeImpersonation>
-  </soap:Header>
-  <soap:Body>
-    <m:GetFolder>
-      <m:FolderShape>
-        <t:BaseShape>IdOnly</t:BaseShape>
-      </m:FolderShape>
-      <m:FolderIds>
-        <t:DistinguishedFolderId Id="$wellKnownName">
-          <t:Mailbox>
-            <t:EmailAddress>$TargetMailbox</t:EmailAddress>
-          </t:Mailbox>
-        </t:DistinguishedFolderId>
-      </m:FolderIds>
-    </m:GetFolder>
-  </soap:Body>
-</soap:Envelope>
-"@
-
+        # Search for existing folder
+        $parentId = if ($currentFolderId) { $currentFolderId } else {
+            New-Object Microsoft.Exchange.WebServices.Data.FolderId([Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::MsgFolderRoot)
+        }
+        
+        $searchFilter = New-Object Microsoft.Exchange.WebServices.Data.SearchFilter+IsEqualTo(
+            [Microsoft.Exchange.WebServices.Data.FolderSchema]::DisplayName,
+            $folderName
+        )
+        
+        $folderView = New-Object Microsoft.Exchange.WebServices.Data.FolderView(1)
+        
         try {
-            $headers = @{
-                "Authorization" = "Bearer $Token"
-                "Content-Type"  = "text/xml; charset=utf-8"
-            }
+            $searchResults = $Service.FindFolders($parentId, $searchFilter, $folderView)
             
-            $response = Invoke-WebRequest -Uri $ewsUrl -Method POST -Headers $headers -Body $getFolderXml -UseBasicParsing
-            $xml = [xml]$response.Content
-            
-            $ns = @{
-                soap = "http://schemas.xmlsoap.org/soap/envelope/"
-                m = "http://schemas.microsoft.com/exchange/services/2006/messages"
-                t = "http://schemas.microsoft.com/exchange/services/2006/types"
-            }
-            
-            $folderId = $xml.SelectSingleNode("//t:FolderId", (New-XmlNamespaceManager $xml $ns))
-            if ($folderId) {
-                $parentFolderId = $folderId.GetAttribute("Id")
+            if ($searchResults.TotalCount -gt 0) {
+                $currentFolderId = $searchResults.Folders[0].Id
+                continue
             }
         }
         catch {
-            Write-Log "Failed to get well-known folder $wellKnownName : $_" -Level Warning
-        }
-    }
-
-    # If we need to create subfolders or the root wasn't well-known
-    if ($parts.Count -gt 1 -or !$parentFolderId) {
-        # For now, just use inbox as fallback for complex paths
-        if (!$parentFolderId) {
-            $parentFolderId = Get-EwsFolderId -TargetMailbox $TargetMailbox -FolderPath "INBOX" -Token $Token -FolderCache $FolderCache
+            Write-Log "Error searching for folder '$folderName': $_" -Level Debug
         }
         
-        # TODO: Create subfolder structure if needed
+        # Create folder
+        try {
+            Write-Log "Creating folder: $folderName" -Level Debug
+            $newFolder = New-Object Microsoft.Exchange.WebServices.Data.Folder($Service)
+            $newFolder.DisplayName = $folderName
+            $newFolder.Save($parentId)
+            $currentFolderId = $newFolder.Id
+        }
+        catch {
+            Write-Log "Failed to create folder '$folderName': $_" -Level Warning
+            # Fallback to Inbox
+            $currentFolderId = New-Object Microsoft.Exchange.WebServices.Data.FolderId([Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::Inbox)
+        }
     }
-
-    $FolderCache[$cacheKey] = $parentFolderId
-    return $parentFolderId
+    
+    $FolderCache[$cacheKey] = $currentFolderId
+    return $currentFolderId
 }
 
-function New-XmlNamespaceManager {
-    param($xml, $namespaces)
-    $nsmgr = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
-    foreach ($key in $namespaces.Keys) {
-        $nsmgr.AddNamespace($key, $namespaces[$key])
-    }
-    return $nsmgr
-}
+# ================================
+# EWS MIME Import
+# ================================
 
-function Import-MessageViaEws {
+function Import-MimeToEws {
     param(
-        [string]$TargetMailbox,
-        [string]$FolderId,
+        $Service,
+        $TargetFolderId,
         [byte[]]$MimeContent,
         [datetime]$ReceivedDate,
         [bool]$IsRead = $true
     )
-
-    $token = Get-OAuthToken
-    $ewsUrl = "https://outlook.office365.com/EWS/Exchange.asmx"
     
-    # Base64 encode the MIME content
-    $mimeBase64 = [Convert]::ToBase64String($MimeContent)
+    # Create email message from MIME - this is the magic!
+    # EWS imports the MIME bytes directly, no conversion needed
+    $email = New-Object Microsoft.Exchange.WebServices.Data.EmailMessage($Service)
     
-    # Use msgfolderroot if no specific folder
-    $folderIdElement = if ($FolderId) {
-        "<t:FolderId Id=`"$FolderId`"/>"
-    } else {
-        @"
-<t:DistinguishedFolderId Id="inbox">
-  <t:Mailbox>
-    <t:EmailAddress>$TargetMailbox</t:EmailAddress>
-  </t:Mailbox>
-</t:DistinguishedFolderId>
-"@
-    }
-
-    # CreateItem with MIME content
-    $createItemXml = @"
-<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-               xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
-               xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types"
-               xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
-  <soap:Header>
-    <t:ExchangeImpersonation>
-      <t:ConnectingSID>
-        <t:SmtpAddress>$TargetMailbox</t:SmtpAddress>
-      </t:ConnectingSID>
-    </t:ExchangeImpersonation>
-  </soap:Header>
-  <soap:Body>
-    <m:CreateItem MessageDisposition="SaveOnly">
-      <m:SavedItemFolderId>
-        $folderIdElement
-      </m:SavedItemFolderId>
-      <m:Items>
-        <t:Message>
-          <t:MimeContent CharacterSet="UTF-8">$mimeBase64</t:MimeContent>
-          <t:IsRead>$($IsRead.ToString().ToLower())</t:IsRead>
-        </t:Message>
-      </m:Items>
-    </m:CreateItem>
-  </soap:Body>
-</soap:Envelope>
-"@
-
-    $headers = @{
-        "Authorization" = "Bearer $token"
-        "Content-Type"  = "text/xml; charset=utf-8"
-    }
-
-    try {
-        $response = Invoke-WebRequest -Uri $ewsUrl -Method POST -Headers $headers -Body $createItemXml -UseBasicParsing
-        
-        if ($response.StatusCode -eq 200) {
-            $xml = [xml]$response.Content
-            
-            # Check for success
-            if ($response.Content -match 'ResponseClass="Success"') {
-                # Extract ItemId
-                if ($response.Content -match 'ItemId Id="([^"]+)"') {
-                    return $matches[1]
-                }
-                return "success"
-            }
-            else {
-                # Extract error
-                if ($response.Content -match '<m:MessageText>([^<]+)</m:MessageText>') {
-                    throw "EWS Error: $($matches[1])"
-                }
-                throw "EWS Error: Unknown error in response"
-            }
-        }
-    }
-    catch {
-        Write-Log "EWS Import failed: $_" -Level Error
-        throw
-    }
+    # Set MIME content directly
+    $email.MimeContent = New-Object Microsoft.Exchange.WebServices.Data.MimeContent("UTF-8", $MimeContent)
+    
+    # Set as read if needed
+    $email.IsRead = $IsRead
+    
+    # Save to target folder (the MIME already contains all headers, body, attachments)
+    $email.Save($TargetFolderId)
+    
+    return $email.Id.UniqueId
 }
 
 # ================================
@@ -488,30 +425,16 @@ function Migrate-UserMailbox {
     Write-Log "Starting migration: $sourceEmail -> $targetEmail" -Level Info -User $sourceEmail
 
     $userStats = @{ TotalMessages = 0; Migrated = 0; Skipped = 0; Failed = 0; Folders = 0 }
-    $client = $null
-    $secureSocket = $null
-
-    # Get OAuth token for EWS
-    $ewsToken = Get-OAuthToken
-
-    # Helper function to connect/reconnect IMAP
-    function Connect-ImapClient {
-        param($client)
-        
-        if ($client.IsConnected) { return }
-        
-        Write-Log "Connecting to IMAP..." -Level Debug -User $sourceEmail
-        $client.Connect($ImapServer, $ImapPort, $secureSocket)
-        $client.Authenticate($imapUsername, $imapPassword)
-    }
+    $imapClient = $null
+    $ewsService = $null
 
     try {
-        # Create MailKit IMAP client for source
-        $client = New-Object MailKit.Net.Imap.ImapClient
-        $client.Timeout = 30000
+        # === Connect to source IMAP (MailKit) ===
+        $imapClient = New-Object MailKit.Net.Imap.ImapClient
+        $imapClient.Timeout = 30000
 
         if ($ImapSkipCertValidation) {
-            $client.ServerCertificateValidationCallback = {
+            $imapClient.ServerCertificateValidationCallback = {
                 param($sender, $certificate, $chain, $sslPolicyErrors)
                 return $true
             }
@@ -524,13 +447,19 @@ function Migrate-UserMailbox {
             [MailKit.Security.SecureSocketOptions]::StartTlsWhenAvailable
         }
 
-        Connect-ImapClient $client
+        Write-Log "Connecting to IMAP $ImapServer`:$ImapPort..." -Level Info -User $sourceEmail
+        $imapClient.Connect($ImapServer, $ImapPort, $secureSocket)
+        $imapClient.Authenticate($imapUsername, $imapPassword)
+        Write-Log "IMAP connected" -Level Success -User $sourceEmail
 
-        Write-Log "Connected to IMAP source" -Level Success -User $sourceEmail
+        # === Connect to target EWS ===
+        Write-Log "Connecting to EWS for $targetEmail..." -Level Info -User $sourceEmail
+        $ewsService = Get-EwsService -TargetMailbox $targetEmail
+        Write-Log "EWS connected" -Level Success -User $sourceEmail
 
-        # Get all folders
-        $personalNamespace = $client.PersonalNamespaces[0]
-        $folders = $client.GetFolders($personalNamespace)
+        # === Get IMAP folders ===
+        $personalNamespace = $imapClient.PersonalNamespaces[0]
+        $folders = $imapClient.GetFolders($personalNamespace)
 
         $folderNames = @($folders | ForEach-Object { $_.FullName })
         Write-Log "Found $($folders.Count) folders: $($folderNames -join ', ')" -Level Info -User $sourceEmail
@@ -565,15 +494,16 @@ function Migrate-UserMailbox {
                 }
             }
 
-            # Reconnect if needed
-            if (!$client.IsConnected) {
+            # Reconnect IMAP if needed
+            if (!$imapClient.IsConnected) {
                 Write-Log "Reconnecting IMAP..." -Level Warning -User $sourceEmail
-                Connect-ImapClient $client
-                $personalNamespace = $client.PersonalNamespaces[0]
-                $folder = $client.GetFolder($folderName)
+                $imapClient.Connect($ImapServer, $ImapPort, $secureSocket)
+                $imapClient.Authenticate($imapUsername, $imapPassword)
+                $personalNamespace = $imapClient.PersonalNamespaces[0]
+                $folder = $imapClient.GetFolder($folderName)
             }
 
-            # Open folder
+            # Open IMAP folder
             try {
                 $folder.Open([MailKit.FolderAccess]::ReadOnly)
             }
@@ -591,7 +521,7 @@ function Migrate-UserMailbox {
             Write-Log "Processing: $folderName ($($folder.Count) messages)" -Level Info -User $sourceEmail
             $userStats.Folders++
 
-            # Search messages
+            # Build search query
             $query = [MailKit.Search.SearchQuery]::All
             if ($StartDate) {
                 $query = $query.And([MailKit.Search.SearchQuery]::DeliveredAfter($StartDate))
@@ -600,10 +530,11 @@ function Migrate-UserMailbox {
                 $query = $query.And([MailKit.Search.SearchQuery]::DeliveredBefore($EndDate))
             }
 
+            # Search messages
             $uids = $folder.Search($query)
             $userStats.TotalMessages += $uids.Count
 
-            Write-Log "Found $($uids.Count) messages" -Level Info -User $sourceEmail
+            Write-Log "Found $($uids.Count) messages matching criteria" -Level Info -User $sourceEmail
 
             if ($uids.Count -eq 0) {
                 $folder.Close()
@@ -622,10 +553,13 @@ function Migrate-UserMailbox {
                 $uidsToProcess = $uids | Select-Object -First $remaining
             }
 
-            # Get target folder ID via EWS
-            $targetFolderId = $null
+            # Get/create EWS target folder
+            $ewsFolderId = $null
             if ($PreserveFolderStructure) {
-                $targetFolderId = Get-EwsFolderId -TargetMailbox $targetEmail -FolderPath $folderName -Token $ewsToken -FolderCache $FolderCache
+                $ewsFolderId = Get-OrCreateEwsFolder -Service $ewsService -FolderPath $folderName -FolderCache $FolderCache
+            }
+            else {
+                $ewsFolderId = New-Object Microsoft.Exchange.WebServices.Data.FolderId([Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::Inbox)
             }
 
             # Process messages
@@ -634,7 +568,7 @@ function Migrate-UserMailbox {
                 $msgIndex++
 
                 try {
-                    # Fetch full message
+                    # Fetch full message with MailKit
                     $message = $folder.GetMessage($uid)
 
                     # Get MIME bytes directly
@@ -651,7 +585,7 @@ function Migrate-UserMailbox {
                     Write-Log "Fetched UID $uid : $($mimeBytes.Length) bytes - $subject" -Level Debug -User $sourceEmail
 
                     if ($mimeBytes.Length -eq 0) {
-                        Write-Log "Empty message, skipping" -Level Warning -User $sourceEmail
+                        Write-Log "Empty message UID $uid, skipping" -Level Warning -User $sourceEmail
                         $userStats.Skipped++
                         continue
                     }
@@ -662,13 +596,7 @@ function Migrate-UserMailbox {
                         continue
                     }
 
-                    # Get date and read status
-                    $receivedDate = if ($message.Date.DateTime -ne [DateTime]::MinValue) {
-                        $message.Date.DateTime
-                    } else {
-                        Get-Date
-                    }
-
+                    # Get read status
                     $isRead = $false
                     try {
                         $summary = $folder.Fetch(@($uid), [MailKit.MessageSummaryItems]::Flags)
@@ -678,10 +606,17 @@ function Migrate-UserMailbox {
                     }
                     catch { }
 
-                    # Import via EWS - MIME stays MIME!
-                    $importedId = Import-MessageViaEws `
-                        -TargetMailbox $targetEmail `
-                        -FolderId $targetFolderId `
+                    # Get date
+                    $receivedDate = if ($message.Date.DateTime -ne [DateTime]::MinValue) {
+                        $message.Date.DateTime
+                    } else {
+                        Get-Date
+                    }
+
+                    # === THE MAGIC: Direct MIME import via EWS ===
+                    $importedId = Import-MimeToEws `
+                        -Service $ewsService `
+                        -TargetFolderId $ewsFolderId `
                         -MimeContent $mimeBytes `
                         -ReceivedDate $receivedDate `
                         -IsRead $isRead
@@ -691,6 +626,7 @@ function Migrate-UserMailbox {
 
                     Write-Log "Migrated [$msgIndex/$($uidsToProcess.Count)]: $subject" -Level Success -User $sourceEmail
 
+                    # Throttle
                     if ($ThrottleMs -gt 0) {
                         Start-Sleep -Milliseconds $ThrottleMs
                     }
@@ -707,16 +643,16 @@ function Migrate-UserMailbox {
             $folder.Close()
         }
 
-        Write-Log "Complete. Migrated: $($userStats.Migrated), Failed: $($userStats.Failed)" -Level Success -User $sourceEmail
+        Write-Log "Complete. Migrated: $($userStats.Migrated), Failed: $($userStats.Failed), Skipped: $($userStats.Skipped)" -Level Success -User $sourceEmail
     }
     catch {
         Write-Log "Migration failed: $_" -Level Error -User $sourceEmail
         throw
     }
     finally {
-        if ($client -and $client.IsConnected) {
-            try { $client.Disconnect($true) } catch { }
-            $client.Dispose()
+        if ($imapClient -and $imapClient.IsConnected) {
+            try { $imapClient.Disconnect($true) } catch { }
+            $imapClient.Dispose()
         }
     }
 
@@ -748,11 +684,11 @@ try {
     Write-Log "=== Kopano IMAP to M365 Migration (EWS) ===" -Level Info
     Write-Log "IMAP Server: ${ImapServer}:${ImapPort}" -Level Info
     Write-Log "Tenant: $TenantId" -Level Info
-    Write-Log "Method: EWS MIME Import (1:1 preservation)" -Level Info
+    Write-Log "Method: EWS MIME Import (cleanest approach)" -Level Info
 
-    # Load MailKit for IMAP source
-    if (!(Initialize-MailKit)) {
-        throw "Failed to load MailKit"
+    # Load libraries
+    if (!(Initialize-Libraries)) {
+        throw "Failed to load libraries"
     }
 
     # Validate parameters
@@ -771,8 +707,8 @@ try {
         Write-Log "*** WHATIF MODE ***" -Level Warning
     }
 
-    # Test EWS connectivity
-    Write-Log "Testing EWS connectivity..." -Level Info
+    # Test OAuth
+    Write-Log "Testing OAuth..." -Level Info
     $null = Get-OAuthToken
 
     # Load users
@@ -802,6 +738,7 @@ try {
         }
     }
 
+    # Folder cache
     $folderCache = @{}
 
     # Process users

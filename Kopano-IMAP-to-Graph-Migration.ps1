@@ -2,12 +2,15 @@
 Kopano-IMAP-to-Graph-Migration.ps1 — IMAP to Microsoft Graph Email Migration
 Migrates emails from Kopano IMAP server to Microsoft 365 via Graph API
 
+Uses MailKit/MimeKit for reliable IMAP operations. Run Setup-MailKit.ps1 first.
+
 Features:
   - Bulk migration from CSV user list
   - Preserves original sent/received dates
   - Maintains folder structure
   - Supports SSL/TLS IMAP connections
   - Progress tracking and detailed logging
+  - Diagnostic mode for troubleshooting
 #>
 
 [CmdletBinding()]
@@ -79,6 +82,17 @@ param(
 
     [switch]$VerboseLogging,                # Enable verbose logging
 
+    # === Diagnostic Options ===
+    [switch]$DiagnosticMode,                # Enable full diagnostic logging (IMAP commands, byte counts, API details)
+
+    [switch]$TestSingleMessage,             # Fetch and display ONE message for debugging, then stop
+
+    [switch]$SaveMimeToFile,                # Save fetched MIME content to disk before importing
+
+    [switch]$SkipGraphImport,               # Test IMAP fetch only, skip Graph API import
+
+    [string]$MimeSavePath = ".\mime_dump",  # Directory to save MIME files when -SaveMimeToFile is used
+
     # === Resume Support ===
     [string]$StateFile,                     # State file for resume capability
 
@@ -91,6 +105,11 @@ param(
 $ErrorActionPreference = 'Stop'
 $script:accessToken = $null
 $script:tokenExpiry = [datetime]::MinValue
+
+# Enable verbose logging in diagnostic mode
+if ($DiagnosticMode) {
+    $VerboseLogging = $true
+}
 
 # Statistics
 $script:stats = @{
@@ -110,490 +129,99 @@ $script:stats = @{
 function Initialize-MailKit {
     <#
     .SYNOPSIS
-    Loads MailKit library for IMAP operations
+    Loads MailKit/MimeKit libraries for IMAP operations.
+    Run Setup-MailKit.ps1 first to download the required DLLs.
     #>
 
-    # Check if MailKit is already loaded
-    $mailkitLoaded = [System.AppDomain]::CurrentDomain.GetAssemblies() |
-        Where-Object { $_.GetName().Name -eq 'MailKit' }
+    $libPath = "$PSScriptRoot\lib"
 
-    if ($mailkitLoaded) {
-        Write-Log "MailKit already loaded" -Level Info
-        return $true
-    }
-
-    # Try to load from NuGet packages
-    $possiblePaths = @(
-        "$PSScriptRoot\packages\MailKit\lib\netstandard2.0\MailKit.dll",
-        "$PSScriptRoot\lib\MailKit.dll",
-        "$env:USERPROFILE\.nuget\packages\mailkit\*\lib\netstandard2.0\MailKit.dll",
-        "$env:USERPROFILE\.nuget\packages\mailkit\*\lib\net6.0\MailKit.dll"
+    # Load in dependency order
+    $dlls = @(
+        "BouncyCastle.Crypto.dll",
+        "MimeKit.dll",
+        "MailKit.dll"
     )
 
-    $mimeKitPaths = @(
-        "$PSScriptRoot\packages\MimeKit\lib\netstandard2.0\MimeKit.dll",
-        "$PSScriptRoot\lib\MimeKit.dll",
-        "$env:USERPROFILE\.nuget\packages\mimekit\*\lib\netstandard2.0\MimeKit.dll",
-        "$env:USERPROFILE\.nuget\packages\mimekit\*\lib\net6.0\MimeKit.dll"
+    foreach ($dll in $dlls) {
+        $dllPath = Join-Path $libPath $dll
+
+        if (Test-Path $dllPath) {
+            try {
+                # Check if already loaded
+                $assemblyName = [System.IO.Path]::GetFileNameWithoutExtension($dll)
+                $alreadyLoaded = [System.AppDomain]::CurrentDomain.GetAssemblies() |
+                    Where-Object { $_.GetName().Name -eq $assemblyName }
+
+                if ($alreadyLoaded) {
+                    Write-Log "Already loaded: $dll" -Level Debug
+                    continue
+                }
+
+                Add-Type -Path $dllPath -ErrorAction Stop
+                Write-Log "Loaded: $dll" -Level Debug
+            }
+            catch [System.Reflection.ReflectionTypeLoadException] {
+                # Already loaded, ignore
+                Write-Log "Assembly $dll already loaded (ReflectionTypeLoadException)" -Level Debug
+            }
+            catch {
+                Write-Log "Warning loading $dll : $_ (may already be loaded)" -Level Debug
+            }
+        }
+        else {
+            throw "Required DLL not found: $dllPath. Run Setup-MailKit.ps1 first to download dependencies."
+        }
+    }
+
+    Write-Log "MailKit/MimeKit loaded successfully" -Level Info
+    return $true
+}
+
+function Get-MailKitClient {
+    <#
+    .SYNOPSIS
+    Creates and connects a MailKit IMAP client.
+    #>
+    param(
+        [string]$Server,
+        [int]$Port,
+        [bool]$UseSsl,
+        [bool]$SkipCertValidation,
+        [string]$Username,
+        [string]$Password
     )
 
-    # Try to find and load MimeKit first (dependency)
-    $mimeKitLoaded = $false
-    foreach ($pattern in $mimeKitPaths) {
-        $paths = Get-ChildItem -Path $pattern -ErrorAction SilentlyContinue |
-            Sort-Object { [version]($_.Directory.Parent.Name -replace '[^\d.]', '') } -Descending |
-            Select-Object -First 1
+    $client = New-Object MailKit.Net.Imap.ImapClient
 
-        if ($paths) {
-            try {
-                Add-Type -Path $paths.FullName
-                Write-Log "Loaded MimeKit from: $($paths.FullName)" -Level Info
-                $mimeKitLoaded = $true
-                break
-            }
-            catch {
-                Write-Log "Failed to load MimeKit from $($paths.FullName): $_" -Level Warning
-            }
+    # Set timeout for reliability
+    $client.Timeout = 120000  # 2 minutes
+
+    # Skip certificate validation if requested (for self-signed certs)
+    if ($SkipCertValidation) {
+        $client.ServerCertificateValidationCallback = {
+            param($sender, $certificate, $chain, $sslPolicyErrors)
+            return $true
         }
     }
 
-    # Try to find and load MailKit
-    foreach ($pattern in $possiblePaths) {
-        $paths = Get-ChildItem -Path $pattern -ErrorAction SilentlyContinue |
-            Sort-Object { [version]($_.Directory.Parent.Name -replace '[^\d.]', '') } -Descending |
-            Select-Object -First 1
-
-        if ($paths) {
-            try {
-                Add-Type -Path $paths.FullName
-                Write-Log "Loaded MailKit from: $($paths.FullName)" -Level Info
-                return $true
-            }
-            catch {
-                Write-Log "Failed to load MailKit from $($paths.FullName): $_" -Level Warning
-            }
-        }
+    # Determine connection security
+    $secureSocket = if ($UseSsl) {
+        [MailKit.Security.SecureSocketOptions]::SslOnConnect
+    } else {
+        [MailKit.Security.SecureSocketOptions]::StartTlsWhenAvailable
     }
 
-    # Try to install via NuGet
-    Write-Log "MailKit not found. Attempting to install via NuGet..." -Level Warning
+    Write-Log "Connecting to IMAP: $Server`:$Port (SSL: $UseSsl, SkipCert: $SkipCertValidation)" -Level Debug
 
-    try {
-        # Check if NuGet provider is available
-        if (!(Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
-            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser
-        }
+    $client.Connect($Server, $Port, $secureSocket)
 
-        # Install MailKit package
-        $installPath = "$PSScriptRoot\packages"
-        if (!(Test-Path $installPath)) {
-            New-Item -ItemType Directory -Path $installPath -Force | Out-Null
-        }
+    Write-Log "Connected. Authenticating as: $Username" -Level Debug
 
-        # Use nuget.exe if available, otherwise use Install-Package
-        $nugetExe = Get-Command nuget.exe -ErrorAction SilentlyContinue
-        if ($nugetExe) {
-            & nuget.exe install MailKit -OutputDirectory $installPath -NonInteractive
-        }
-        else {
-            # Fallback: try to use .NET restore or manual download
-            Write-Log "Please install MailKit manually:" -Level Warning
-            Write-Log "  Option 1: dotnet add package MailKit" -Level Warning
-            Write-Log "  Option 2: Install-Package MailKit -Scope CurrentUser" -Level Warning
-            Write-Log "  Option 3: Download from https://www.nuget.org/packages/MailKit/" -Level Warning
-            return $false
-        }
+    $client.Authenticate($Username, $Password)
 
-        # Retry loading
-        return Initialize-MailKit
-    }
-    catch {
-        Write-Log "Failed to install MailKit: $_" -Level Error
-        return $false
-    }
-}
+    Write-Log "IMAP authentication successful" -Level Debug
 
-# ================================
-# Alternative: Pure .NET IMAP Implementation
-# ================================
-
-# IMAP UTF-7 Decoding for folder names (e.g., &APw- -> ü)
-function ConvertFrom-ImapUtf7 {
-    param([string]$EncodedString)
-
-    if ([string]::IsNullOrEmpty($EncodedString)) {
-        return $EncodedString
-    }
-
-    # IMAP uses modified UTF-7 where & is the shift character
-    $result = New-Object System.Text.StringBuilder
-    $i = 0
-
-    while ($i -lt $EncodedString.Length) {
-        if ($EncodedString[$i] -eq '&') {
-            # Check for &- which is literal &
-            if ($i + 1 -lt $EncodedString.Length -and $EncodedString[$i + 1] -eq '-') {
-                $result.Append('&') | Out-Null
-                $i += 2
-                continue
-            }
-
-            # Find end of encoded sequence
-            $endIdx = $EncodedString.IndexOf('-', $i + 1)
-            if ($endIdx -eq -1) {
-                $result.Append($EncodedString[$i]) | Out-Null
-                $i++
-                continue
-            }
-
-            # Extract Base64 encoded part
-            $encoded = $EncodedString.Substring($i + 1, $endIdx - $i - 1)
-
-            if ($encoded.Length -gt 0) {
-                try {
-                    # IMAP UTF-7 uses , instead of / in Base64
-                    $base64 = $encoded.Replace(',', '/')
-
-                    # Pad if necessary
-                    $padding = (4 - ($base64.Length % 4)) % 4
-                    $base64 = $base64 + ('=' * $padding)
-
-                    # Decode as UTF-16BE
-                    $bytes = [Convert]::FromBase64String($base64)
-                    $decoded = [System.Text.Encoding]::BigEndianUnicode.GetString($bytes)
-                    $result.Append($decoded) | Out-Null
-                }
-                catch {
-                    # If decoding fails, keep original
-                    $result.Append($EncodedString.Substring($i, $endIdx - $i + 1)) | Out-Null
-                }
-            }
-
-            $i = $endIdx + 1
-        }
-        else {
-            $result.Append($EncodedString[$i]) | Out-Null
-            $i++
-        }
-    }
-
-    return $result.ToString()
-}
-
-class SimpleImapClient {
-    [System.Net.Sockets.TcpClient]$TcpClient
-    [System.IO.StreamReader]$Reader
-    [System.IO.StreamWriter]$Writer
-    [System.Net.Security.SslStream]$SslStream
-    [int]$TagCounter = 0
-    [bool]$Connected = $false
-    [bool]$SkipCertValidation = $false
-
-    SimpleImapClient([bool]$skipCertValidation) {
-        $this.SkipCertValidation = $skipCertValidation
-    }
-
-    [string] GetNextTag() {
-        $this.TagCounter++
-        return "A{0:D4}" -f $this.TagCounter
-    }
-
-    [void] Connect([string]$server, [int]$port, [bool]$useSsl) {
-        $this.TcpClient = New-Object System.Net.Sockets.TcpClient
-        $this.TcpClient.Connect($server, $port)
-
-        if ($useSsl) {
-            if ($this.SkipCertValidation) {
-                # Use delegate that always returns true for self-signed certs
-                $certCallback = {
-                    param($sender, $cert, $chain, $errors)
-                    return $true
-                }
-                $this.SslStream = New-Object System.Net.Security.SslStream(
-                    $this.TcpClient.GetStream(),
-                    $false,
-                    [System.Net.Security.RemoteCertificateValidationCallback]$certCallback
-                )
-            }
-            else {
-                $this.SslStream = New-Object System.Net.Security.SslStream(
-                    $this.TcpClient.GetStream(),
-                    $false
-                )
-            }
-
-            # Use TLS 1.2 explicitly for compatibility
-            $sslProtocols = [System.Security.Authentication.SslProtocols]::Tls12
-            $this.SslStream.AuthenticateAsClient($server, $null, $sslProtocols, $false)
-
-            $this.Reader = New-Object System.IO.StreamReader($this.SslStream)
-            $this.Writer = New-Object System.IO.StreamWriter($this.SslStream)
-        }
-        else {
-            $stream = $this.TcpClient.GetStream()
-            $this.Reader = New-Object System.IO.StreamReader($stream)
-            $this.Writer = New-Object System.IO.StreamWriter($stream)
-        }
-
-        $this.Writer.AutoFlush = $true
-
-        # Read greeting
-        $greeting = $this.Reader.ReadLine()
-        if ($greeting -notmatch '^\* OK') {
-            throw "IMAP server did not send OK greeting: $greeting"
-        }
-
-        $this.Connected = $true
-    }
-
-    [hashtable] SendCommand([string]$command) {
-        $tag = $this.GetNextTag()
-        $this.Writer.WriteLine("$tag $command")
-
-        $response = @{
-            Tag = $tag
-            Lines = @()
-            Success = $false
-            ResultLine = ""
-        }
-
-        while ($true) {
-            $line = $this.Reader.ReadLine()
-            if ($null -eq $line) {
-                throw "Connection closed unexpectedly"
-            }
-
-            if ($line.StartsWith($tag)) {
-                $response.ResultLine = $line
-                $response.Success = $line -match "^$tag OK"
-                break
-            }
-
-            $response.Lines += $line
-        }
-
-        return $response
-    }
-
-    [bool] Login([string]$username, [string]$password) {
-        # Escape special characters in password
-        $escapedPassword = $password -replace '\\', '\\' -replace '"', '\"'
-        $result = $this.SendCommand("LOGIN `"$username`" `"$escapedPassword`"")
-        return $result.Success
-    }
-
-    [array] ListFolders() {
-        $result = $this.SendCommand('LIST "" "*"')
-        $folders = @()
-
-        foreach ($line in $result.Lines) {
-            if ($line -match '^\* LIST \(([^)]*)\) "([^"]*)" "?([^"]+)"?$') {
-                $flags = $matches[1]
-                $delimiter = $matches[2]
-                $name = $matches[3] -replace '^"', '' -replace '"$', ''
-
-                $folders += @{
-                    Name = $name
-                    Flags = $flags
-                    Delimiter = $delimiter
-                }
-            }
-        }
-
-        return $folders
-    }
-
-    [hashtable] SelectFolder([string]$folder) {
-        $result = $this.SendCommand("SELECT `"$folder`"")
-
-        $info = @{
-            Success = $result.Success
-            Exists = 0
-            Recent = 0
-            UidValidity = 0
-        }
-
-        foreach ($line in $result.Lines) {
-            if ($line -match '^\* (\d+) EXISTS') {
-                $info.Exists = [int]$matches[1]
-            }
-            elseif ($line -match '^\* (\d+) RECENT') {
-                $info.Recent = [int]$matches[1]
-            }
-            elseif ($line -match 'UIDVALIDITY (\d+)') {
-                $info.UidValidity = [int]$matches[1]
-            }
-        }
-
-        return $info
-    }
-
-    [array] SearchMessages([string]$criteria = "ALL") {
-        $result = $this.SendCommand("UID SEARCH $criteria")
-        $uids = @()
-
-        foreach ($line in $result.Lines) {
-            if ($line -match '^\* SEARCH (.*)$') {
-                $uids = $matches[1].Trim().Split(' ') | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ }
-            }
-        }
-
-        return $uids
-    }
-
-    [hashtable] FetchMessageHeaders([int]$uid) {
-        $result = $this.SendCommand("UID FETCH $uid (BODY.PEEK[HEADER] INTERNALDATE FLAGS)")
-
-        $message = @{
-            UID = $uid
-            Headers = ""
-            InternalDate = $null
-            Flags = @()
-        }
-
-        $inHeaders = $false
-        $headerLines = @()
-
-        foreach ($line in $result.Lines) {
-            if ($line -match 'INTERNALDATE "([^"]+)"') {
-                try {
-                    $message.InternalDate = [datetime]::ParseExact(
-                        $matches[1],
-                        "d-MMM-yyyy HH:mm:ss zzz",
-                        [System.Globalization.CultureInfo]::InvariantCulture
-                    )
-                }
-                catch {
-                    # Try alternative format
-                    try {
-                        $message.InternalDate = [datetime]::Parse($matches[1])
-                    }
-                    catch { }
-                }
-            }
-
-            if ($line -match 'FLAGS \(([^)]*)\)') {
-                $message.Flags = $matches[1].Split(' ')
-            }
-
-            if ($line -match 'BODY\[HEADER\]') {
-                $inHeaders = $true
-                continue
-            }
-
-            if ($inHeaders) {
-                if ($line -eq ')' -or $line -match '^\)$') {
-                    $inHeaders = $false
-                }
-                else {
-                    $headerLines += $line
-                }
-            }
-        }
-
-        $message.Headers = $headerLines -join "`r`n"
-
-        return $message
-    }
-
-    [string] FetchMessageRaw([int]$uid) {
-        $result = $this.SendCommand("UID FETCH $uid (BODY.PEEK[])")
-
-        $messageLines = @()
-        $inMessage = $false
-        $bytesToRead = 0
-
-        foreach ($line in $result.Lines) {
-            if ($line -match 'BODY\[\] \{(\d+)\}') {
-                $bytesToRead = [int]$matches[1]
-                $inMessage = $true
-                continue
-            }
-
-            if ($inMessage) {
-                if ($line -eq ')' -and $messageLines.Count -gt 0) {
-                    break
-                }
-                $messageLines += $line
-            }
-        }
-
-        return ($messageLines -join "`r`n")
-    }
-
-    [byte[]] FetchMessageBytes([int]$uid) {
-        $tag = $this.GetNextTag()
-        $this.Writer.WriteLine("$tag UID FETCH $uid (BODY.PEEK[])")
-        $this.Writer.Flush()
-
-        # Get the underlying stream for direct byte reading
-        $stream = if ($this.SslStream) { $this.SslStream } else { $this.TcpClient.GetStream() }
-
-        $allBytes = New-Object System.Collections.Generic.List[byte]
-        $lineBuffer = New-Object System.Collections.Generic.List[byte]
-
-        # Read byte by byte to handle literal correctly
-        while ($true) {
-            $b = $stream.ReadByte()
-            if ($b -eq -1) {
-                throw "Connection closed unexpectedly"
-            }
-
-            $lineBuffer.Add([byte]$b)
-
-            # Check for end of line (CRLF)
-            if ($lineBuffer.Count -ge 2 -and
-                $lineBuffer[$lineBuffer.Count - 2] -eq 13 -and  # CR
-                $lineBuffer[$lineBuffer.Count - 1] -eq 10) {    # LF
-
-                # Convert line to string (without CRLF)
-                $lineBytes = $lineBuffer.ToArray()
-                $line = [System.Text.Encoding]::ASCII.GetString($lineBytes, 0, $lineBytes.Length - 2)
-                $lineBuffer.Clear()
-
-                # Check if this is the tagged response (end)
-                if ($line.StartsWith($tag)) {
-                    break
-                }
-
-                # Check for literal start: {size}
-                if ($line -match '\{(\d+)\}$') {
-                    $literalSize = [int]$matches[1]
-
-                    # Read literal bytes directly
-                    $buffer = New-Object byte[] $literalSize
-                    $bytesRead = 0
-
-                    while ($bytesRead -lt $literalSize) {
-                        $chunk = $stream.Read($buffer, $bytesRead, $literalSize - $bytesRead)
-                        if ($chunk -eq 0) {
-                            throw "Connection closed while reading literal"
-                        }
-                        $bytesRead += $chunk
-                    }
-
-                    $allBytes.AddRange($buffer)
-                }
-            }
-        }
-
-        return $allBytes.ToArray()
-    }
-
-    [void] Logout() {
-        if ($this.Connected) {
-            try {
-                $this.SendCommand("LOGOUT")
-            }
-            catch { }
-
-            $this.Reader.Dispose()
-            $this.Writer.Dispose()
-            if ($this.SslStream) { $this.SslStream.Dispose() }
-            $this.TcpClient.Close()
-            $this.Connected = $false
-        }
-    }
+    return $client
 }
 
 # ================================
@@ -615,6 +243,7 @@ function Initialize-Logging {
 Kopano IMAP to Graph Migration Log
 Started: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
 IMAP Server: $ImapServer`:$ImapPort
+Engine: MailKit/MimeKit
 ========================================
 
 "@
@@ -748,20 +377,17 @@ function Get-OrCreateMailFolder {
         [hashtable]$FolderCache = @{}
     )
 
-    # Decode IMAP UTF-7 encoding in folder path (e.g., &APw- -> ü)
-    $decodedPath = ConvertFrom-ImapUtf7 -EncodedString $FolderPath
-
     # Check cache first
-    $cacheKey = "$TargetMailbox|$decodedPath"
+    $cacheKey = "$TargetMailbox|$FolderPath"
     if ($FolderCache.ContainsKey($cacheKey)) {
         return $FolderCache[$cacheKey]
     }
 
-    # Normalize folder path
-    $normalizedPath = $decodedPath -replace '/', '\' -replace '\\+', '\'
+    # Normalize folder path — handle both / and . delimiters
+    $normalizedPath = $FolderPath -replace '/', '\' -replace '\.', '\' -replace '\\+', '\'
     $parts = $normalizedPath.Split('\') | Where-Object { $_ -ne '' }
 
-    # Map common folder names
+    # Map common folder names to well-known Graph folder IDs
     $folderMapping = @{
         'INBOX'          = 'Inbox'
         'Sent'           = 'SentItems'
@@ -864,21 +490,28 @@ function Import-MessageToGraph {
         [bool]$IsRead = $true
     )
 
-    # Graph API supports importing MIME messages
-    # First create in root messages, then move to target folder (more reliable)
-
     $token = Get-GraphToken
     $createUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages"
+    $messageId = $null
+    $lastError = $null
 
-    # Method 1: Direct MIME import (like reference script)
+    if ($DiagnosticMode) {
+        Write-Log "DIAG: Import-MessageToGraph called. MimeContent size: $($MimeContent.Length) bytes, FolderId: $FolderId" -Level Debug
+    }
+
+    # Method 1: Direct MIME import via Invoke-WebRequest
     try {
         $headers = @{
             "Authorization" = "Bearer $token"
             "Content-Type"  = "text/plain"
         }
 
-        # Convert bytes to string preserving all byte values (ISO-8859-1 is 1:1 mapping)
+        # Convert bytes to string preserving all byte values (ISO-8859-1 is 1:1 mapping for 0-255)
         $mimeString = [System.Text.Encoding]::GetEncoding("ISO-8859-1").GetString($MimeContent)
+
+        if ($DiagnosticMode) {
+            Write-Log "DIAG: Method 1 - Sending MIME string ($($mimeString.Length) chars) to $createUri" -Level Debug
+        }
 
         $response = Invoke-WebRequest -Method POST -Uri $createUri -Headers $headers -Body $mimeString -UseBasicParsing
 
@@ -886,7 +519,11 @@ function Import-MessageToGraph {
             $createdMessage = $response.Content | ConvertFrom-Json
             $messageId = $createdMessage.id
 
-            # Move to target folder if not Inbox
+            if ($DiagnosticMode) {
+                Write-Log "DIAG: Method 1 SUCCESS - Message ID: $messageId" -Level Debug
+            }
+
+            # Move to target folder if not default
             if ($FolderId) {
                 try {
                     $moveUri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/messages/$messageId/move"
@@ -915,12 +552,13 @@ function Import-MessageToGraph {
                 $reader.Close()
             } catch {}
         }
-        Write-Log "MIME import method 1 failed: $errorMsg $errorDetails" -Level Debug
+        $lastError = $_
+        Write-Log "MIME import method 1 failed: $errorMsg $errorDetails" -Level Warning
     }
 
     # Method 2: Try with HttpClient and raw bytes
     try {
-        Add-Type -AssemblyName System.Net.Http
+        Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
 
         $httpClient = New-Object System.Net.Http.HttpClient
         $httpClient.DefaultRequestHeaders.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", $token)
@@ -929,12 +567,20 @@ function Import-MessageToGraph {
         $content = New-Object System.Net.Http.ByteArrayContent(,$MimeContent)
         $content.Headers.ContentType = New-Object System.Net.Http.Headers.MediaTypeHeaderValue("text/plain")
 
+        if ($DiagnosticMode) {
+            Write-Log "DIAG: Method 2 - Sending raw bytes ($($MimeContent.Length) bytes) via HttpClient" -Level Debug
+        }
+
         $response = $httpClient.PostAsync($createUri, $content).Result
 
         if ($response.IsSuccessStatusCode) {
             $responseContent = $response.Content.ReadAsStringAsync().Result
             $createdMessage = $responseContent | ConvertFrom-Json
             $messageId = $createdMessage.id
+
+            if ($DiagnosticMode) {
+                Write-Log "DIAG: Method 2 SUCCESS - Message ID: $messageId" -Level Debug
+            }
 
             # Move to target folder if specified
             if ($FolderId) {
@@ -957,18 +603,35 @@ function Import-MessageToGraph {
         }
         else {
             $errorContent = $response.Content.ReadAsStringAsync().Result
-            Write-Log "MIME import method 2 failed: $($response.StatusCode) - $errorContent" -Level Debug
+            $lastError = "HTTP $($response.StatusCode): $errorContent"
+            Write-Log "MIME import method 2 failed: $($response.StatusCode) - $errorContent" -Level Warning
         }
 
         $httpClient.Dispose()
     }
     catch {
-        Write-Log "MIME import method 2 exception: $_" -Level Debug
+        $lastError = $_
+        Write-Log "MIME import method 2 exception: $_" -Level Warning
     }
 
     # Method 3: Fallback to wrapper with .eml attachment
-    Write-Log "Using fallback method (wrapper with .eml attachment)" -Level Warning
-    return Import-MessageToGraphBase64 -TargetMailbox $TargetMailbox -FolderId $FolderId -MimeContent $MimeContent -ReceivedDate $ReceivedDate -IsRead $IsRead
+    Write-Log "Using fallback method 3 (wrapper with .eml attachment)" -Level Warning
+    try {
+        $messageId = Import-MessageToGraphBase64 -TargetMailbox $TargetMailbox -FolderId $FolderId -MimeContent $MimeContent -ReceivedDate $ReceivedDate -IsRead $IsRead
+
+        if ($DiagnosticMode) {
+            Write-Log "DIAG: Method 3 SUCCESS - Message ID: $messageId" -Level Debug
+        }
+
+        return $messageId
+    }
+    catch {
+        $lastError = $_
+        Write-Log "MIME import method 3 (Base64 fallback) also failed: $_" -Level Error
+    }
+
+    # All methods failed
+    throw "All 3 import methods failed for message. Last error: $lastError"
 }
 
 function Set-MessageDateAndFlags {
@@ -1032,9 +695,6 @@ function Import-MessageToGraphBase64 {
         [datetime]$ReceivedDate,
         [bool]$IsRead = $true
     )
-
-    # Use createUploadSession for larger messages or problematic MIME
-    # Or convert to draft message approach
 
     $uri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/mailFolders/$FolderId/messages"
 
@@ -1161,57 +821,6 @@ function Import-MessageToGraphBase64 {
     }
 }
 
-function Import-MessageToGraphAlternative {
-    <#
-    .SYNOPSIS
-    Alternative method using message creation with explicit date setting
-    #>
-    param(
-        [string]$TargetMailbox,
-        [string]$FolderId,
-        [hashtable]$MessageData,
-        [datetime]$ReceivedDate
-    )
-
-    $uri = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/mailFolders/$FolderId/messages"
-
-    $message = @{
-        subject = $MessageData.Subject
-        body = @{
-            contentType = "HTML"
-            content = $MessageData.Body
-        }
-        from = @{
-            emailAddress = @{
-                address = $MessageData.From
-            }
-        }
-        toRecipients = @(
-            $MessageData.To | ForEach-Object {
-                @{ emailAddress = @{ address = $_ } }
-            }
-        )
-        isRead = $MessageData.IsRead
-        # receivedDateTime will be set to creation time by Graph API
-        # Unfortunately, we cannot set receivedDateTime directly
-        internetMessageHeaders = @(
-            @{ name = "X-Original-Date"; value = $ReceivedDate.ToString("r") }
-            @{ name = "X-Migration-Source"; value = "Kopano-IMAP" }
-            @{ name = "X-Migration-Date"; value = (Get-Date).ToString("r") }
-        )
-    }
-
-    if ($MessageData.Cc) {
-        $message.ccRecipients = @(
-            $MessageData.Cc | ForEach-Object {
-                @{ emailAddress = @{ address = $_ } }
-            }
-        )
-    }
-
-    return Invoke-GraphRequest -Uri $uri -Method POST -Body $message
-}
-
 # ================================
 # CSV Processing
 # ================================
@@ -1251,58 +860,8 @@ function Import-UserCsv {
 }
 
 # ================================
-# IMAP Migration Functions
+# Folder Exclusion
 # ================================
-
-function Get-ImapClient {
-    param(
-        [string]$Server,
-        [int]$Port,
-        [bool]$UseSsl,
-        [bool]$SkipCertValidation
-    )
-
-    # Set global certificate validation policy if skipping validation
-    if ($SkipCertValidation) {
-        # Save current callback
-        $script:originalCertCallback = [System.Net.ServicePointManager]::ServerCertificateValidationCallback
-
-        # Set callback to accept all certificates
-        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {
-            param($sender, $certificate, $chain, $sslPolicyErrors)
-            return $true
-        }
-
-        Write-Log "SSL certificate validation disabled (self-signed cert mode)" -Level Warning
-    }
-
-    # Ensure TLS 1.2 is enabled
-    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
-
-    $client = [SimpleImapClient]::new($SkipCertValidation)
-    $client.Connect($Server, $Port, $UseSsl)
-
-    return $client
-}
-
-function Get-MessageSearchCriteria {
-    $criteria = "ALL"
-    $parts = @()
-
-    if ($StartDate) {
-        $parts += "SINCE $($StartDate.ToString('dd-MMM-yyyy'))"
-    }
-
-    if ($EndDate) {
-        $parts += "BEFORE $($EndDate.ToString('dd-MMM-yyyy'))"
-    }
-
-    if ($parts.Count -gt 0) {
-        $criteria = $parts -join " "
-    }
-
-    return $criteria
-}
 
 function Test-FolderExcluded {
     param([string]$FolderName)
@@ -1315,6 +874,10 @@ function Test-FolderExcluded {
 
     return $false
 }
+
+# ================================
+# IMAP Migration (MailKit-based)
+# ================================
 
 function Migrate-UserMailbox {
     param(
@@ -1340,142 +903,213 @@ function Migrate-UserMailbox {
     $client = $null
 
     try {
-        # Connect to IMAP
-        Write-Log "Connecting to IMAP server..." -Level Info -User $sourceEmail
-        $client = Get-ImapClient -Server $ImapServer -Port $ImapPort -UseSsl $ImapUseSsl -SkipCertValidation $ImapSkipCertValidation
+        # Connect to IMAP using MailKit
+        Write-Log "Connecting to IMAP server via MailKit..." -Level Info -User $sourceEmail
+        $client = Get-MailKitClient `
+            -Server $ImapServer `
+            -Port $ImapPort `
+            -UseSsl $ImapUseSsl `
+            -SkipCertValidation $ImapSkipCertValidation `
+            -Username $imapUsername `
+            -Password $imapPassword
 
-        # Login
-        Write-Log "Authenticating..." -Level Debug -User $sourceEmail
-        $loginSuccess = $client.Login($imapUsername, $imapPassword)
+        Write-Log "Successfully connected to IMAP via MailKit" -Level Success -User $sourceEmail
 
-        if (!$loginSuccess) {
-            throw "IMAP login failed for user $imapUsername"
+        if ($DiagnosticMode) {
+            Write-Log "DIAG: IMAP capabilities: $($client.Capabilities)" -Level Debug -User $sourceEmail
         }
 
-        Write-Log "Successfully logged in to IMAP" -Level Success -User $sourceEmail
+        # Get all folders using MailKit's namespace support
+        $personalNamespace = $client.PersonalNamespaces[0]
+        $folders = $client.GetFolders($personalNamespace)
 
-        # Get folder list
-        $folders = $client.ListFolders()
         Write-Log "Found $($folders.Count) folders" -Level Info -User $sourceEmail
+
+        if ($DiagnosticMode) {
+            foreach ($f in $folders) {
+                Write-Log "DIAG: Folder: '$($f.FullName)' (Attributes: $($f.Attributes))" -Level Debug -User $sourceEmail
+            }
+        }
 
         # Filter folders if specified
         if ($FoldersToMigrate -and $FoldersToMigrate.Count -gt 0) {
             $folders = $folders | Where-Object {
-                $folderName = $_.Name
-                $FoldersToMigrate | Where-Object { $folderName -ilike $_ }
+                $folderName = $_.FullName
+                $FoldersToMigrate | Where-Object { $folderName -ilike $_ -or $folderName -ieq $_ }
             }
+            Write-Log "Filtered to $($folders.Count) folders matching criteria" -Level Info -User $sourceEmail
         }
 
         # Process each folder
         foreach ($folder in $folders) {
-            $folderName = $folder.Name
-            $folderDisplayName = ConvertFrom-ImapUtf7 -EncodedString $folderName  # Decoded for display
+            $folderName = $folder.FullName
 
-            # Check exclusions (check both encoded and decoded names)
-            if ((Test-FolderExcluded -FolderName $folderName) -or (Test-FolderExcluded -FolderName $folderDisplayName)) {
-                Write-Log "Skipping excluded folder: $folderDisplayName" -Level Debug -User $sourceEmail
+            # Check exclusions
+            if (Test-FolderExcluded -FolderName $folderName) {
+                Write-Log "Skipping excluded folder: $folderName" -Level Debug -User $sourceEmail
                 continue
             }
 
-            # Check for \Noselect flag
-            if ($folder.Flags -match '\\Noselect') {
-                Write-Log "Skipping non-selectable folder: $folderDisplayName" -Level Debug -User $sourceEmail
+            # Skip non-selectable folders
+            if ($folder.Attributes -band [MailKit.FolderAttributes]::NonExistent) {
+                Write-Log "Skipping non-existent folder: $folderName" -Level Debug -User $sourceEmail
                 continue
             }
 
-            Write-Log "Processing folder: $folderDisplayName" -Level Info -User $sourceEmail
+            # Open folder read-only
+            try {
+                $folder.Open([MailKit.FolderAccess]::ReadOnly)
+            }
+            catch {
+                Write-Log "Cannot open folder: $folderName - $_" -Level Warning -User $sourceEmail
+                continue
+            }
+
+            if ($folder.Count -eq 0) {
+                Write-Log "Folder is empty: $folderName" -Level Debug -User $sourceEmail
+                $folder.Close()
+                continue
+            }
+
+            Write-Log "Processing folder: $folderName ($($folder.Count) messages)" -Level Info -User $sourceEmail
             $userStats.Folders++
 
             try {
-                # Select folder
-                $folderInfo = $client.SelectFolder($folderName)
+                # Build search query using MailKit's search API
+                $query = [MailKit.Search.SearchQuery]::All
 
-                if (!$folderInfo.Success) {
-                    Write-Log "Failed to select folder: $folderDisplayName" -Level Warning -User $sourceEmail
-                    continue
+                if ($StartDate) {
+                    $query = [MailKit.Search.SearchQuery]::And($query, [MailKit.Search.SearchQuery]::DeliveredAfter($StartDate))
                 }
-
-                if ($folderInfo.Exists -eq 0) {
-                    Write-Log "Folder is empty: $folderDisplayName" -Level Debug -User $sourceEmail
-                    continue
+                if ($EndDate) {
+                    $query = [MailKit.Search.SearchQuery]::And($query, [MailKit.Search.SearchQuery]::DeliveredBefore($EndDate))
                 }
-
-                Write-Log "Folder has $($folderInfo.Exists) messages" -Level Info -User $sourceEmail
 
                 # Search messages
-                $searchCriteria = Get-MessageSearchCriteria
-                $messageUids = $client.SearchMessages($searchCriteria)
+                $uids = $folder.Search($query)
 
-                if ($messageUids.Count -eq 0) {
-                    Write-Log "No messages match criteria in folder: $folderDisplayName" -Level Debug -User $sourceEmail
+                if ($uids.Count -eq 0) {
+                    Write-Log "No messages match criteria in folder: $folderName" -Level Debug -User $sourceEmail
+                    $folder.Close()
                     continue
                 }
 
-                Write-Log "Found $($messageUids.Count) messages matching criteria" -Level Info -User $sourceEmail
-                $userStats.TotalMessages += $messageUids.Count
+                Write-Log "Found $($uids.Count) messages matching criteria" -Level Info -User $sourceEmail
+                $userStats.TotalMessages += $uids.Count
 
                 # Limit messages if specified
-                if ($MaxMessagesPerMailbox -and ($userStats.Migrated + $messageUids.Count) -gt $MaxMessagesPerMailbox) {
+                $uidsToProcess = $uids
+                if ($MaxMessagesPerMailbox -and ($userStats.Migrated + $uids.Count) -gt $MaxMessagesPerMailbox) {
                     $remaining = $MaxMessagesPerMailbox - $userStats.Migrated
                     if ($remaining -le 0) {
                         Write-Log "Reached message limit, stopping folder processing" -Level Warning -User $sourceEmail
+                        $folder.Close()
                         break
                     }
-                    $messageUids = $messageUids | Select-Object -First $remaining
+                    $uidsToProcess = @($uids | Select-Object -First $remaining)
                 }
 
-                # Get or create target folder
+                # Get or create target folder in Graph
                 $targetFolderId = $null
                 if ($PreserveFolderStructure) {
                     $targetFolderId = Get-OrCreateMailFolder -TargetMailbox $targetEmail -FolderPath $folderName -FolderCache $FolderCache
                 }
                 else {
-                    # Use Inbox as default target
                     $targetFolderId = Get-OrCreateMailFolder -TargetMailbox $targetEmail -FolderPath "Inbox" -FolderCache $FolderCache
                 }
 
                 # Process messages
-                $messageCount = 0
-                foreach ($uid in $messageUids) {
-                    $messageCount++
+                $msgIndex = 0
+                foreach ($uid in $uidsToProcess) {
+                    $msgIndex++
 
                     try {
-                        # Fetch message
-                        Write-Log "Fetching message $messageCount/$($messageUids.Count) (UID: $uid)..." -Level Debug -User $sourceEmail
+                        Write-Log "Fetching message $msgIndex/$($uidsToProcess.Count) (UID: $uid)..." -Level Debug -User $sourceEmail
 
-                        # Get headers first for info
-                        $headers = $client.FetchMessageHeaders($uid)
+                        # Fetch full MimeMessage using MailKit
+                        $message = $folder.GetMessage($uid)
 
-                        $receivedDate = if ($headers.InternalDate) {
-                            $headers.InternalDate
-                        } else {
-                            Get-Date
+                        # Get subject for logging
+                        $subject = if ($message.Subject) { $message.Subject } else { "(no subject)" }
+                        if ($subject.Length -gt 60) {
+                            $subject = $subject.Substring(0, 57) + "..."
                         }
 
-                        $isRead = $headers.Flags -contains '\Seen'
+                        # Serialize to raw MIME bytes
+                        $memStream = New-Object System.IO.MemoryStream
+                        $message.WriteTo($memStream)
+                        $mimeBytes = $memStream.ToArray()
+                        $memStream.Dispose()
 
-                        # Parse subject from headers for logging
-                        $subject = "Unknown"
-                        if ($headers.Headers -match 'Subject:\s*(.+?)(?:\r?\n(?!\s)|$)') {
-                            $subject = $matches[1].Trim()
-                            if ($subject.Length -gt 50) {
-                                $subject = $subject.Substring(0, 47) + "..."
+                        Write-Log "Fetched UID $uid: $($mimeBytes.Length) bytes - $subject" -Level Debug -User $sourceEmail
+
+                        if ($DiagnosticMode) {
+                            Write-Log "DIAG: Message Date: $($message.Date), From: $($message.From), MessageId: $($message.MessageId)" -Level Debug -User $sourceEmail
+                        }
+
+                        if ($mimeBytes.Length -eq 0) {
+                            Write-Log "WARNING: Empty message content for UID $uid, skipping" -Level Warning -User $sourceEmail
+                            $userStats.Skipped++
+                            continue
+                        }
+
+                        # Save MIME to file if requested
+                        if ($SaveMimeToFile) {
+                            if (!(Test-Path $MimeSavePath)) {
+                                New-Item -ItemType Directory -Path $MimeSavePath -Force | Out-Null
                             }
+                            $safeSubject = ($subject -replace '[^\w\-\.]', '_')
+                            if ($safeSubject.Length -gt 40) { $safeSubject = $safeSubject.Substring(0, 40) }
+                            $mimeFilePath = Join-Path $MimeSavePath "uid_${uid}_${safeSubject}.eml"
+                            [System.IO.File]::WriteAllBytes($mimeFilePath, $mimeBytes)
+                            Write-Log "Saved MIME to: $mimeFilePath ($($mimeBytes.Length) bytes)" -Level Info -User $sourceEmail
+                        }
+
+                        # TestSingleMessage mode: display details and stop
+                        if ($TestSingleMessage) {
+                            Write-Log "=== TEST SINGLE MESSAGE ===" -Level Info -User $sourceEmail
+                            Write-Log "  UID: $uid" -Level Info -User $sourceEmail
+                            Write-Log "  Subject: $($message.Subject)" -Level Info -User $sourceEmail
+                            Write-Log "  From: $($message.From)" -Level Info -User $sourceEmail
+                            Write-Log "  To: $($message.To)" -Level Info -User $sourceEmail
+                            Write-Log "  Date: $($message.Date)" -Level Info -User $sourceEmail
+                            Write-Log "  MessageId: $($message.MessageId)" -Level Info -User $sourceEmail
+                            Write-Log "  MIME size: $($mimeBytes.Length) bytes" -Level Info -User $sourceEmail
+                            Write-Log "  Content-Type: $($message.Body.ContentType)" -Level Info -User $sourceEmail
+
+                            # Show first 500 chars of MIME
+                            $mimePreview = [System.Text.Encoding]::UTF8.GetString($mimeBytes, 0, [Math]::Min(500, $mimeBytes.Length))
+                            Write-Log "  MIME preview:`n$mimePreview" -Level Info -User $sourceEmail
+                            Write-Log "=== END TEST ===" -Level Info -User $sourceEmail
+
+                            $folder.Close()
+                            return $userStats
                         }
 
                         if ($WhatIf) {
-                            Write-Log "[WHATIF] Would migrate: $subject (Date: $($receivedDate.ToString('yyyy-MM-dd')))" -Level Info -User $sourceEmail
+                            Write-Log "[WHATIF] Would migrate: $subject (Date: $($message.Date.ToString('yyyy-MM-dd')))" -Level Info -User $sourceEmail
                             $userStats.Migrated++
                             continue
                         }
 
-                        # Fetch full message as raw bytes (preserves binary content correctly)
-                        $messageBytes = $client.FetchMessageBytes($uid)
-
-                        if (!$messageBytes -or $messageBytes.Length -eq 0) {
-                            Write-Log "Empty message content for UID $uid, skipping" -Level Warning -User $sourceEmail
-                            $userStats.Skipped++
+                        if ($SkipGraphImport) {
+                            Write-Log "[SKIP-IMPORT] IMAP fetch OK: $subject ($($mimeBytes.Length) bytes)" -Level Success -User $sourceEmail
+                            $userStats.Migrated++
                             continue
+                        }
+
+                        # Determine received date
+                        $receivedDate = if ($message.Date.DateTime -ne [DateTime]::MinValue) {
+                            $message.Date.DateTime
+                        } else {
+                            Get-Date
+                        }
+
+                        # Check if message was read
+                        $msgSummary = $folder.Fetch(@($uid), [MailKit.MessageSummaryItems]::Flags)
+                        $isRead = $false
+                        if ($msgSummary -and $msgSummary.Count -gt 0) {
+                            $isRead = [bool]($msgSummary[0].Flags -band [MailKit.MessageFlags]::Seen)
                         }
 
                         # Import to Graph
@@ -1484,14 +1118,18 @@ function Migrate-UserMailbox {
                         $importedId = Import-MessageToGraph `
                             -TargetMailbox $targetEmail `
                             -FolderId $targetFolderId `
-                            -MimeContent $messageBytes `
+                            -MimeContent $mimeBytes `
                             -ReceivedDate $receivedDate `
                             -IsRead $isRead
 
-                        $userStats.Migrated++
-                        $script:stats.MigratedMessages++
-
-                        Write-Log "Migrated: $subject" -Level Success -User $sourceEmail
+                        if ($importedId) {
+                            $userStats.Migrated++
+                            $script:stats.MigratedMessages++
+                            Write-Log "Migrated [$msgIndex/$($uidsToProcess.Count)]: $subject" -Level Success -User $sourceEmail
+                        }
+                        else {
+                            throw "Import returned no message ID"
+                        }
 
                         # Throttle
                         if ($ThrottleMs -gt 0) {
@@ -1503,6 +1141,10 @@ function Migrate-UserMailbox {
                         $script:stats.FailedMessages++
                         Write-Log "Failed to migrate message UID $uid : $_" -Level Error -User $sourceEmail
 
+                        if ($DiagnosticMode) {
+                            Write-Log "DIAG: Stack trace: $($_.ScriptStackTrace)" -Level Debug -User $sourceEmail
+                        }
+
                         if (!$ContinueOnError) {
                             throw
                         }
@@ -1510,12 +1152,16 @@ function Migrate-UserMailbox {
                 }
             }
             catch {
-                Write-Log "Error processing folder $folderDisplayName : $_" -Level Error -User $sourceEmail
+                Write-Log "Error processing folder $folderName : $_" -Level Error -User $sourceEmail
 
                 if (!$ContinueOnError) {
+                    $folder.Close()
                     throw
                 }
             }
+
+            # Close folder after processing
+            try { $folder.Close() } catch { }
         }
 
         Write-Log "User migration complete. Migrated: $($userStats.Migrated), Failed: $($userStats.Failed), Skipped: $($userStats.Skipped)" -Level Success -User $sourceEmail
@@ -1526,12 +1172,15 @@ function Migrate-UserMailbox {
     }
     finally {
         # Cleanup IMAP connection
-        if ($client -and $client.Connected) {
+        if ($client) {
             try {
-                $client.Logout()
+                if ($client.IsConnected) {
+                    $client.Disconnect($true)
+                }
+                $client.Dispose()
             }
             catch {
-                Write-Log "Error during IMAP logout: $_" -Level Debug -User $sourceEmail
+                Write-Log "Error during IMAP cleanup: $_" -Level Debug -User $sourceEmail
             }
         }
     }
@@ -1578,6 +1227,17 @@ try {
     Write-Log "IMAP Server: $ImapServer`:$ImapPort (SSL: $ImapUseSsl)" -Level Info
     Write-Log "Tenant ID: $TenantId" -Level Info
     Write-Log "Client ID: $ClientId" -Level Info
+    Write-Log "Engine: MailKit/MimeKit" -Level Info
+
+    if ($DiagnosticMode) {
+        Write-Log "*** DIAGNOSTIC MODE ENABLED ***" -Level Warning
+    }
+
+    # Load MailKit/MimeKit assemblies
+    $mailkitReady = Initialize-MailKit
+    if (!$mailkitReady) {
+        throw "Failed to load MailKit/MimeKit. Run Setup-MailKit.ps1 first."
+    }
 
     # === Validate Parameters ===
     if ($TestMode -or $TestSource -or $TestTarget -or $TestPassword) {
@@ -1599,6 +1259,18 @@ try {
         Write-Log "*** WHATIF MODE - No actual migration will occur ***" -Level Warning
     }
 
+    if ($SkipGraphImport) {
+        Write-Log "*** SKIP GRAPH IMPORT - IMAP fetch testing only ***" -Level Warning
+    }
+
+    if ($TestSingleMessage) {
+        Write-Log "*** TEST SINGLE MESSAGE MODE - Will fetch one message and stop ***" -Level Warning
+    }
+
+    if ($SaveMimeToFile) {
+        Write-Log "*** SAVING MIME FILES TO: $MimeSavePath ***" -Level Warning
+    }
+
     if ($StartDate -or $EndDate) {
         Write-Log "Date filter: $StartDate to $EndDate" -Level Info
     }
@@ -1607,9 +1279,14 @@ try {
         Write-Log "Max messages per mailbox: $MaxMessagesPerMailbox" -Level Info
     }
 
-    # Test Graph API connectivity
-    Write-Log "Testing Graph API connectivity..." -Level Info
-    $null = Get-GraphToken
+    # Test Graph API connectivity (skip if not needed)
+    if (!$SkipGraphImport) {
+        Write-Log "Testing Graph API connectivity..." -Level Info
+        $null = Get-GraphToken
+    }
+    else {
+        Write-Log "Skipping Graph API token (SkipGraphImport mode)" -Level Info
+    }
 
     # Load user list (CSV or Test mode)
     $users = @()
@@ -1756,12 +1433,15 @@ catch {
     This script connects to an IMAP server (designed for Kopano) and migrates
     emails to Microsoft 365 mailboxes using the Microsoft Graph API.
 
+    Uses MailKit/MimeKit for reliable IMAP operations. Run Setup-MailKit.ps1 first.
+
     Features:
     - Bulk migration from CSV user list
     - Preserves original email dates via MIME import
     - Maintains folder structure
     - Resume capability for interrupted migrations
     - Detailed logging and error handling
+    - Diagnostic mode for troubleshooting
 
 .PARAMETER TenantId
     Microsoft 365 tenant ID
@@ -1808,6 +1488,21 @@ catch {
 .PARAMETER PreserveReceivedDate
     Preserve original received date (default: true)
 
+.PARAMETER DiagnosticMode
+    Enable full diagnostic logging (IMAP commands, byte counts, Graph API details)
+
+.PARAMETER TestSingleMessage
+    Fetch and display ONE message for debugging, then stop
+
+.PARAMETER SaveMimeToFile
+    Save fetched MIME content to disk before importing to Graph
+
+.PARAMETER SkipGraphImport
+    Test IMAP fetch only, skip Graph API import
+
+.PARAMETER MimeSavePath
+    Directory to save MIME files when -SaveMimeToFile is used (default: .\mime_dump)
+
 .PARAMETER WhatIf
     Dry run - show what would be migrated without actually migrating
 
@@ -1821,6 +1516,10 @@ catch {
     Resume from previous state file
 
 .EXAMPLE
+    # First run setup to download MailKit:
+    .\Setup-MailKit.ps1
+
+    # Then run migration:
     .\Kopano-IMAP-to-Graph-Migration.ps1 `
         -TenantId "your-tenant-id" `
         -ClientId "your-client-id" `
@@ -1830,6 +1529,21 @@ catch {
         -WhatIf
 
     Dry run to test configuration
+
+.EXAMPLE
+    .\Kopano-IMAP-to-Graph-Migration.ps1 `
+        -TenantId "your-tenant-id" `
+        -ClientId "your-client-id" `
+        -ClientSecret "your-secret" `
+        -ImapServer "mail.kopano.local" `
+        -TestMode `
+        -TestSource "user@company.com" `
+        -TestTarget "user@company.com" `
+        -TestPassword "password" `
+        -TestSingleMessage `
+        -DiagnosticMode
+
+    Debug mode: fetch one message with full diagnostics
 
 .EXAMPLE
     .\Kopano-IMAP-to-Graph-Migration.ps1 `
@@ -1859,6 +1573,10 @@ catch {
     Migrate only specific folders with message limit
 
 .NOTES
+    Prerequisites:
+    - Run Setup-MailKit.ps1 to download MailKit/MimeKit DLLs
+    - PowerShell 5.1 or later (or PowerShell 7+)
+
     CSV Format:
     Email,Username,Password,TargetEmail
     user@company.com,user,password123,user@company.onmicrosoft.com
